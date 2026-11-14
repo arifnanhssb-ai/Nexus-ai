@@ -10,6 +10,7 @@ import { verifyLivePreviewWithDom, createCheckpoint } from "./workspaceEngine.ts
 import { sanitizeSessionId, startWorkspaceServer } from "./sandboxManager.ts";
 import { loadSecretsFromPersistence, saveSecretsToPersistence } from "./persistenceStore.ts";
 import { runVisualQaReview } from "./visualQa.ts";
+import { auditFirestoreRules } from "./firebaseProvisioner.ts";
 import {
   buildHarnessPreFlightContext,
   isGitHubClonePrompt,
@@ -923,6 +924,9 @@ function mapToolToActionStep(toolName: string, args: any): { kind: ActionStepKin
     args?.Prompt ||
     args?.message ||
     (Array.isArray(args?.PackageNames) ? args.PackageNames.join(', ') : args?.packageName) ||
+    (toolName === 'plan' && Array.isArray(args?.steps)
+      ? `${args.steps.length} steps: ${args.steps.slice(0, 3).map((s: any) => (typeof s === 'string' ? s : s?.title || '')).filter(Boolean).join(' → ')}`
+      : '') ||
     args?.TaskId ||
     '';
 
@@ -1143,6 +1147,7 @@ function selectRelevantTools(
     'read_multiple_files',
     'compute_file_diff',
     'read_skill',
+    'plan',
   ]);
 
   const lower = (promptText || '').toLowerCase();
@@ -1186,11 +1191,13 @@ function selectRelevantTools(
     baseTools.add('focus_mode');
     baseTools.add('visual_qa_review');
   }
-  if (/(website|landing|store|shop|ecommerce|e-commerce|portfolio|dashboard|saas|game|pwa|ওয়েবসাইট|ওয়েবসাইট|ড্যাশবোর্ড|ই-কমার্স|স্টোর|পোর্টফোলিও|গেম)/i.test(lower)) {
+  if (/(website|landing|store|shop|ecommerce|e-commerce|portfolio|dashboard|saas|game|pwa|portal|platform|app|ওয়েবসাইট|ওয়েবসাইট|ড্যাশবোর্ড|ই-কমার্স|স্টোর|পোর্টফোলিও|গেম|অ্যাপ|বানাও|তৈরি)/i.test(lower)) {
     baseTools.add('generate_image');
     baseTools.add('visual_qa_review');
     baseTools.add('workspace_init');
     baseTools.add('workspace_run');
+    baseTools.add('set_up_firebase');
+    baseTools.add('deploy_firebase');
   }
   if (/(search|docs|latest|find online|web|url|https?:\/\/|সার্চ|খুঁজ)/i.test(lower) || mode === 'search') {
     baseTools.add('search_web');
@@ -1199,7 +1206,7 @@ function selectRelevantTools(
   if (/(image|banner|logo|icon|illustration|ছবি|লোগো)/i.test(lower) || mode === 'image') {
     baseTools.add('generate_image');
   }
-  if (/(firebase|firestore|auth|login|signup|account|profile|role|admin|realtime|chat|database|sql|postgres|turso|supabase|sqlite|persist|db|ফায়ারবেস|ফায়ারবেস|লগইন|অ্যাকাউন্ট|ডাটাবেজ|সেভ)/i.test(lower)) {
+  if (/(firebase|firestore|auth|login|signup|account|profile|role|admin|realtime|chat|database|sql|postgres|turso|supabase|sqlite|persist|db|saas|ecommerce|e-commerce|store|booking|crm|portal|order|ফায়ারবেস|ফায়ারবেস|লগইন|অ্যাকাউন্ট|ডাটাবেজ|সেভ|বুকিং|অর্ডার)/i.test(lower)) {
     baseTools.add('set_up_firebase');
     baseTools.add('deploy_firebase');
     baseTools.add('cloudsql_execute_sql');
@@ -1741,7 +1748,7 @@ async function auditLargeModularWorkspace(wsDir: string): Promise<{
       const full = path.join(dir, ent.name);
       if (ent.isDirectory()) {
         await walk(full);
-      } else if (/\.(ts|tsx)$/i.test(ent.name) && ent.name !== 'vite-env.d.ts' && ent.name !== 'main.tsx') {
+      } else if (/\.(ts|tsx|js|jsx|css)$/i.test(ent.name) && ent.name !== 'vite-env.d.ts' && ent.name !== 'main.tsx') {
         fileCount++;
         try {
           const raw = await fs.readFile(full, 'utf-8');
@@ -1874,14 +1881,51 @@ async function runMandatorySelfHealingGate(
       if (isModularWebsiteTask && !isClonedRepoTask) {
         const wsAudit = await auditLargeModularWorkspace(wsDir);
         const isFreshInit = Boolean(harnessCtx?.sharedProgress?.executedTools?.includes('workspace_init'));
-        const isMassiveScaleRequest = /(5000|10000|5,000|10,000|5k|10k|৫\s*হাজার|১০\s*হাজার|পুর্নাঙ্গ|পূর্ণাঙ্গ|mega|enterprise|full-?scale)/i.test(
+        const isMassiveScaleRequest = /(5000|10000|5,000|10,000|5k|10k|৫\s*হাজার|১০\s*হাজার|হাজার\s*লাইন|পুর্নাঙ্গ|পূর্ণাঙ্গ|mega|enterprise|full-?scale)/i.test(
           harnessCtx?.originalPrompt || ''
         );
         const minFiles = isMassiveScaleRequest ? 14 : 10;
-        const minLines = isMassiveScaleRequest && (harnessCtx?.selfHealRound || 0) === 0 ? 3200 : 1400;
+        const minLines = isMassiveScaleRequest && (harnessCtx?.selfHealRound || 0) === 0 ? 2800 : 1500;
         if (wsAudit.hasUntouchedBoilerplate || ((isFreshInit || wsAudit.fileCount < minFiles) && (wsAudit.fileCount < minFiles || wsAudit.totalLines < minLines))) {
           failures.push(
-            `[Large Website Scale & Completeness Audit Failed (/w/${safeWsId})]: Found ${wsAudit.fileCount} modular files (${wsAudit.totalLines} lines${wsAudit.hasUntouchedBoilerplate ? ', starter "Modular Workspace Ready" boilerplate still untouched' : ''}). Nexus delivers full-scale modular websites (minimum ${minFiles} modular files and ${minLines}+ total lines). Batch 2-4 parallel write_to_file calls per turn to expand rich data modules (src/data/), hooks (src/hooks/), 10+ UI components (src/components/*.tsx), and 4+ interactive pages (src/pages/*.tsx).`
+            `[Large Website Scale & Completeness Audit Failed (/w/${safeWsId})]: Found ${wsAudit.fileCount} modular files (${wsAudit.totalLines} lines${wsAudit.hasUntouchedBoilerplate ? ', starter "Modular Workspace Ready" boilerplate still untouched' : ''}). Nexus delivers full-scale modular websites (minimum ${minFiles} modular files and ${minLines}+ total lines). Batch 2-4 parallel write_to_file calls per turn to expand rich data modules (src/data/), hooks (src/hooks/), 8+ UI components (src/components/*.tsx), and 3-5+ interactive pages (src/pages/*.tsx).`
+          );
+        }
+
+        // Code-Matched Firebase Backend Audit (verify rules, SDK, provider & backend service wiring)
+        const bpRaw = await fs.readFile(path.join(wsDir, 'firebase-blueprint.json'), 'utf-8').catch(() => '');
+        const needsFirebaseBackend = /(firebase|firestore|auth|login|signup|account|saas|ecommerce|e-commerce|store|portal|crm|booking|dashboard|database|persist|বুকিং|লগইন|ই-কমার্স|ডাটাবেজ|ফায়ারবেস|ফায়ারবেস)/i.test(
+          harnessCtx?.originalPrompt || ''
+        );
+        if (bpRaw.trim()) {
+          let parsedBp: any = null;
+          try { parsedBp = JSON.parse(bpRaw); } catch {}
+          const rulesRaw = await fs.readFile(path.join(wsDir, 'firestore.rules'), 'utf-8').catch(() => '');
+          const rulesCheck = auditFirestoreRules(rulesRaw, parsedBp);
+          if (!rulesCheck.valid) {
+            failures.push(
+              `[Firebase firestore.rules Validation Failed (/w/${safeWsId})]: ${rulesCheck.issues.join(' | ')}. Call set_up_firebase(sessionId: "${safeWsId}", platform: "web", skipInteractivePrompt: true) or deploy_firebase(sessionId: "${safeWsId}").`
+            );
+          }
+          const hasFbBackend = await fs.access(path.join(wsDir, 'src/services/firebaseBackend.ts')).then(() => true).catch(() => false);
+          const hasFbSdk = await fs.access(path.join(wsDir, 'src/lib/firebase.ts')).then(() => true).catch(() => false);
+          const hasFbProvider = await fs.access(path.join(wsDir, 'src/components/FirebaseProvider.tsx')).then(() => true).catch(() => false);
+          if (!hasFbBackend || !hasFbSdk || !hasFbProvider) {
+            failures.push(
+              `[Firebase Backend Wiring Incomplete (/w/${safeWsId})]: Missing ${[!hasFbSdk && 'src/lib/firebase.ts', !hasFbProvider && 'src/components/FirebaseProvider.tsx', !hasFbBackend && 'src/services/firebaseBackend.ts'].filter(Boolean).join(', ')}. Call set_up_firebase(sessionId: "${safeWsId}", platform: "web", skipInteractivePrompt: true) to generate code-matched Firebase backend modules.`
+            );
+          } else {
+            const appRaw = await fs.readFile(path.join(wsDir, 'src/App.tsx'), 'utf-8').catch(() => '');
+            const mainRaw = await fs.readFile(path.join(wsDir, 'src/main.tsx'), 'utf-8').catch(() => '');
+            if (!/FirebaseProvider/.test(appRaw) && !/FirebaseProvider/.test(mainRaw)) {
+              failures.push(
+                `[FirebaseProvider Not Wired (/w/${safeWsId})]: src/App.tsx or src/main.tsx must wrap the root app in <FirebaseProvider> from './components/FirebaseProvider' and connect hooks/pages to './services/firebaseBackend'.`
+              );
+            }
+          }
+        } else if (needsFirebaseBackend && (harnessCtx?.selfHealRound || 0) === 0) {
+          failures.push(
+            `[Code-Matched Firebase Backend Missing (/w/${safeWsId})]: This app requires persistent data/auth/backend. Call set_up_firebase(sessionId: "${safeWsId}", platform: "web", skipInteractivePrompt: true, blueprint: {...}) matching src/types.ts, wrap src/App.tsx in <FirebaseProvider>, wire CRUD to src/services/firebaseBackend.ts, and call deploy_firebase(sessionId: "${safeWsId}").`
           );
         }
       }
@@ -2099,33 +2143,77 @@ async function streamOpenAICompatible(
   let inlineHotSwaps = 0;
   const requiresImplementation = isActionOrBuildPrompt(rawUserPrompt);
 
+  // Convert native tool_call/tool-role history into provider-neutral messages when hopping to a different OpenAI-compatible API
+  const normalizeCrossProviderMessages = (msgs: any[]): any[] => {
+    const out: any[] = [];
+    for (let i = 0; i < msgs.length; i++) {
+      const m = msgs[i];
+      if (m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
+        const callNames = m.tool_calls.map((tc: any) => tc?.function?.name || 'tool').join(', ');
+        const textPrefix = typeof m.content === 'string' && m.content.trim() ? `${m.content.trim()}\n` : '';
+        out.push({ role: 'assistant', content: `${textPrefix}[Executed tools: ${callNames}]` });
+        continue;
+      }
+      if (m.role === 'tool') {
+        const snippet = typeof m.content === 'string' ? m.content.slice(0, 500) : JSON.stringify(m.content || '').slice(0, 500);
+        const prev = out[out.length - 1];
+        if (prev && prev.role === 'user' && typeof prev.content === 'string' && prev.content.startsWith('[TOOL RESULTS]:')) {
+          prev.content += `\n- ${snippet}`;
+        } else {
+          out.push({ role: 'user', content: `[TOOL RESULTS]:\n- ${snippet}` });
+        }
+        continue;
+      }
+      out.push(m);
+    }
+    return out;
+  };
+
+  let currentMessages: any[] = openAiMessages;
   const healthyPoolCount = Math.max(1, poolKeys.filter(k => k.isActive && getOrCreateStats(k.id).cooldownUntil <= Date.now()).length);
   const maxRounds = allowTools ? 60 : 1;
   for (let round = 0; round < maxRounds; round++) {
-    // Per-round zero-wait same-provider key hopping (distributes RPM evenly across 3+ pooled keys without losing tool-call continuity)
+    // Per-round proactive multi-API load balancing across ALL healthy OpenAI-compatible keys (same provider first, then cross-provider collaboration)
     if (round > 0 && activeKeyObj && poolKeys.length > 1) {
-      const sameProviderKeys = poolKeys.filter(k =>
+      const openAiPoolCandidates = poolKeys.filter(k =>
         k.isActive &&
-        k.provider === activeKeyObj!.provider &&
         k.id !== activeKeyObj!.id &&
+        ['openrouter', 'groq', 'cerebras', 'mistral', 'grok', 'custom'].includes(k.provider) &&
         getOrCreateStats(k.id).cooldownUntil <= Date.now()
       );
-      if (sameProviderKeys.length > 0) {
-        const { key: nextSameKey } = selectBestKey(sameProviderKeys, activeKeyObj.provider, new Set(), null, { loadBalance: true });
-        if (nextSameKey && nextSameKey.id !== activeKeyObj.id) {
+      if (openAiPoolCandidates.length > 0) {
+        const sameProviderKeys = openAiPoolCandidates.filter(k => k.provider === activeKeyObj!.provider);
+        const candidatePool = sameProviderKeys.length > 0 ? sameProviderKeys : openAiPoolCandidates;
+        const { key: nextKey } = selectBestKey(candidatePool, 'all', new Set(), null, { loadBalance: true });
+        if (nextKey && nextKey.id !== activeKeyObj.id) {
           const currStats = getOrCreateStats(activeKeyObj.id);
-          const nextStats = getOrCreateStats(nextSameKey.id);
-          if (nextStats.timestamps.length < currStats.timestamps.length || currStats.timestamps.length >= Math.max(2, Math.floor((activeKeyObj.rpmLimit || 15) * 0.5))) {
-            activeKeyObj = nextSameKey;
-            activeApiKey = nextSameKey.apiKey;
-            activeEndpoint = getOpenAICompatibleEndpoint(nextSameKey.provider, nextSameKey.baseUrl);
-            const nextChain = getProviderModelChain(nextSameKey.provider, normalizeModelName(nextSameKey.provider, nextSameKey.model));
-            targetModel = nextChain[0] || normalizeModelName(nextSameKey.provider, nextSameKey.model);
+          const nextStats = getOrCreateStats(nextKey.id);
+          const shouldRotateProvider =
+            sameProviderKeys.length > 0
+              ? nextStats.timestamps.length < currStats.timestamps.length || currStats.timestamps.length >= Math.max(2, Math.floor((activeKeyObj.rpmLimit || 15) * 0.5))
+              : round % 2 === 0 || currStats.timestamps.length >= Math.max(2, Math.floor((activeKeyObj.rpmLimit || 15) * 0.45));
+
+          if (shouldRotateProvider) {
+            const switchedProvider = nextKey.provider !== activeKeyObj.provider;
+            activeKeyObj = nextKey;
+            activeApiKey = nextKey.apiKey;
+            activeEndpoint = getOpenAICompatibleEndpoint(nextKey.provider, nextKey.baseUrl);
+            activeHeaders = nextKey.provider === 'openrouter'
+              ? { 'HTTP-Referer': 'https://nexus-ai.local', 'X-Title': 'Nexus AI' }
+              : {};
+            const nextChain = getProviderModelChain(nextKey.provider, normalizeModelName(nextKey.provider, nextKey.model));
+            targetModel = nextChain[0] || normalizeModelName(nextKey.provider, nextKey.model);
+            if (switchedProvider) {
+              // Ensure tool-history compatibility when collaborating across different OpenAI-compatible APIs
+              const normalized = normalizeCrossProviderMessages(openAiMessages);
+              openAiMessages.length = 0;
+              openAiMessages.push(...normalized);
+            }
             sendEvent({
               type: 'key_active',
-              keyId: nextSameKey.id,
-              keyName: nextSameKey.name,
-              provider: nextSameKey.provider,
+              keyId: nextKey.id,
+              keyName: nextKey.name,
+              provider: nextKey.provider,
               model: targetModel,
               isCustomKey: true,
             });
@@ -2133,8 +2221,9 @@ async function streamOpenAICompatible(
         }
       }
     }
+    currentMessages = openAiMessages;
 
-    const compactedMessages = compactOpenAIMessages(openAiMessages);
+    let compactedMessages = compactOpenAIMessages(currentMessages);
     await paceAndTrackKeyRound(activeKeyObj, round, sendEvent, estimateTokensFromPayload(compactedMessages), healthyPoolCount);
     const buildPayload = (useModel: string, useTools: boolean) => {
       const payload: any = {
@@ -2316,6 +2405,7 @@ The server will execute it immediately and send back the result so you can conti
         const { key: swapKey } = selectBestKey(eligibleSwapKeys, 'all', new Set(), null, { loadBalance: true });
         if (swapKey) {
           inlineHotSwaps++;
+          const prevProvider = activeKeyObj.provider;
           activeKeyObj = swapKey;
           activeApiKey = swapKey.apiKey;
           activeEndpoint = getOpenAICompatibleEndpoint(swapKey.provider, swapKey.baseUrl);
@@ -2324,6 +2414,12 @@ The server will execute it immediately and send back the result so you can conti
             : {};
           const chain = getProviderModelChain(swapKey.provider, normalizeModelName(swapKey.provider, swapKey.model));
           targetModel = chain[0] || normalizeModelName(swapKey.provider, swapKey.model);
+          if (swapKey.provider !== prevProvider) {
+            const normalized = normalizeCrossProviderMessages(openAiMessages);
+            openAiMessages.length = 0;
+            openAiMessages.push(...normalized);
+            compactedMessages = compactOpenAIMessages(openAiMessages);
+          }
           sendEvent({
             type: "key_active",
             keyId: swapKey.id,
@@ -2574,7 +2670,7 @@ The server will execute it immediately and send back the result so you can conti
       continue;
     }
 
-    if (allowTools && didMutateFiles && selfHealRounds < 3) {
+    if (allowTools && didMutateFiles && selfHealRounds < 4) {
       const gate = await runMandatorySelfHealingGate(
         sharedProgress?.mutatedFiles || new Set(),
         execCtx?.sessionId,
@@ -3516,6 +3612,9 @@ MANDATORY WEBSITE REPLICATION GUIDELINES:
         geminiApiKey: geminiCreds?.apiKey,
         geminiModel: geminiCreds?.model,
         llmInvoker: invoker,
+        allowInteractiveFirebasePrompt:
+          /(firebase|firestore|ফায়ারবেস|ফায়ারবেস)/i.test(initialLastMessage) &&
+          /(connect|setup|set\s*up|link|config|credential|কানেক্ট|সেটআপ|লিঙ্ক|কনফিগ|যুক্ত)/i.test(initialLastMessage),
         onAskQuestion: (questions) => {
           const questionId = `q_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
           return new Promise((resolve) => {

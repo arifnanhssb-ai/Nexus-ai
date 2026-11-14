@@ -351,40 +351,43 @@ export function getVerifiedScaffoldBlueprint(promptText: string, sessionId?: str
   const isBuild = shouldUseModularArchitecture(promptText) || /(build|create|make|design|develop|app|website|dashboard|saas|store|ecommerce|e-commerce|portfolio|landing|auth|login|api|বানা|তৈরি|ওয়েবসাইট|ওয়েবসাইট|সাইট|ড্যাশবোর্ড|ই-কমার্স)/i.test(lower);
   if (!isBuild) return null;
 
-  const needsBackend = /(full-?stack|express|backend|database|api|postgres|sqlite|crud|auth|login|ফুল-স্ট্যাক)/i.test(lower);
+  const needsBackend = /(full-?stack|express|backend|database|api|postgres|sqlite|crud|auth|login|firebase|firestore|saas|ecommerce|e-commerce|store|portal|crm|booking|ফুল-স্ট্যাক|ই-কমার্স|ডাটাবেজ|ফায়ারবেস|ফায়ারবেস)/i.test(lower);
   const modular = shouldUseModularArchitecture(promptText);
   const modularLayout = modular
-    ? `\n- FULL-SCALE MODULAR WEBSITE ARCHITECTURE (15–30+ FILES, 3,500–9,500+ TOTAL LINES — PARALLEL BATCH WRITES):
-  Call workspace_init(sessionId: "${safeId}", template: "${needsBackend ? 'fullstack-express' : 'react-vite'}") first, replace ALL starter template text, and batch 2–4 parallel write_to_file calls per turn (200–340 lines per file) inside workspaces/${safeId}/:
-  * src/types.ts (comprehensive domain TypeScript interfaces, filter/sort/modal/cart/analytics types)
-  * src/data/seed.ts + src/data/analytics.ts (rich multi-category dataset: 15–30+ items, time-series metrics, testimonials, pricing plans, FAQ)
-  * src/utils/formatters.ts + src/hooks/useWorkspaceState.ts (localStorage persistence, filtering, sorting, CRUD, undo/toast state)
-  * src/components/*.tsx (10–16+ focused components: Navbar, MobileNavDrawer, HeroSection, StatsStrip, FilterSidebar, SearchCommandBar, CatalogOrGrid, ItemCard, InteractiveChartPanel, ComparisonTable, DetailModal, CartOrActionDrawer, TestimonialsSection, FaqAccordion, ContactOrInquirySection, Footer)
-  * src/pages/*.tsx (4–6+ complete interactive views: HomePage, ExplorePage, AnalyticsPage, SavedOrOrdersPage, SettingsOrProfilePage)
-  * src/App.tsx (clean multi-page router, keyboard shortcuts, toast provider & modal orchestrator)${needsBackend ? `\n  * server/routes.ts + server.ts (real Express REST CRUD API mounted at /w/${safeId}/api and /api)` : ''}
-  * Start preview via workspace_run(action: "start") -> live at /w/${safeId}/`
+    ? `\n- FULL-SCALE SESSION-SCOPED MODULAR ARCHITECTURE + CODE-MATCHED FIREBASE BACKEND (12–30+ FILES, 2,500–9,500+ TOTAL LINES — PARALLEL BATCH WRITES):
+  1) Call \`plan(steps: [...])\` + \`read_skill("frontend-design")\` + \`read_skill("firebase-integration")\` first.
+  2) Call \`workspace_init(sessionId: "${safeId}", template: "${needsBackend ? 'fullstack-express' : 'react-vite'}")\`, replace ALL starter template text, and batch 2–4 parallel \`write_to_file\` calls per turn inside \`workspaces/${safeId}/\`:
+     * \`src/types.ts\` (comprehensive domain TypeScript interfaces, filter/sort/modal/cart/analytics types)
+     * \`src/data/seed.ts\` + \`src/data/analytics.ts\` (rich multi-category dataset: 15–30+ items, time-series metrics, testimonials, pricing plans, FAQ)
+  3) Call \`set_up_firebase(sessionId: "${safeId}", platform: "web", skipInteractivePrompt: true, blueprint: {...})\` matching your \`src/types.ts\` entities/collections (writes \`firebase-blueprint.json\`, security-hardened \`firestore.rules\`, \`src/lib/firebase.ts\`, \`src/components/FirebaseProvider.tsx\`, \`src/services/firebaseBackend.ts\`${needsBackend ? ', `server/firebaseAdmin.ts`' : ''}), then call \`deploy_firebase(sessionId: "${safeId}")\`.
+  4) Batch parallel \`write_to_file\` calls for:
+     * \`src/utils/formatters.ts\` + \`src/hooks/useWorkspaceState.ts\` (real CRUD & real-time sync wired to \`src/services/firebaseBackend.ts\` + local fallback)
+     * \`src/components/*.tsx\` (8–16+ focused components: Navbar, MobileNavDrawer, HeroSection, StatsStrip, FilterSidebar, SearchCommandBar, CatalogOrGrid, ItemCard, InteractiveChartPanel, ComparisonTable, DetailModal, CartOrActionDrawer, AuthProfileModal, TestimonialsSection, FaqAccordion, Footer)
+     * \`src/pages/*.tsx\` (4–6+ complete interactive views: HomePage, ExplorePage, AnalyticsPage, SavedOrOrdersPage, SettingsOrProfilePage)
+     * \`src/App.tsx\` (clean multi-page router wrapped in \`<FirebaseProvider>\`, keyboard shortcuts, toast provider & modal orchestrator)${needsBackend ? `\n     * \`server/routes.ts\` + \`server.ts\` (real Express REST CRUD API mounted at \`/w/${safeId}/api\` and \`/api\`, wired with \`server/firebaseAdmin.ts\`)` : ''}
+  5) Start session preview via \`workspace_run(action: "start")\` -> live at \`/w/${safeId}/\`, then verify with \`verify_live_preview\`.`
     : '';
 
   if (/(saas|dashboard|admin|analytics|crm|erp|inventory|ড্যাশবোর্ড|অ্যাডমিন)/i.test(lower)) {
     return `[VERIFIED LARGE SCAFFOLD BLUEPRINT — SAAS / DASHBOARD]:
-- Use full-scale modular architecture: Sidebar + Topbar + 4-6 Multi-Page Views + KPI Summary Strip + Interactive SVG Charts + Sortable/Filterable Data Table + Create/Edit Drawer + Persistent State/API.
-- Every tab, filter, search box, sort toggle, and CRUD modal must mutate real state and update visible UI immediately.${modularLayout}`;
+- Use full-scale modular architecture: Sidebar + Topbar + 4-6 Multi-Page Views + KPI Summary Strip + Interactive SVG Charts + Sortable/Filterable Data Table + Create/Edit Drawer + Code-Matched Firebase Backend (\`firebaseBackend.ts\` + \`firestore.rules\`).
+- Every tab, filter, search box, sort toggle, and CRUD modal must mutate real state and persist cleanly.${modularLayout}`;
   }
 
   if (/(store|shop|ecommerce|e-commerce|product|cart|checkout|ই-কমার্স|স্টোর|দোকান)/i.test(lower)) {
     return `[VERIFIED LARGE SCAFFOLD BLUEPRINT — E-COMMERCE]:
-- Use full-scale modular storefront architecture: Sticky Header (Search + Multi-Page Nav + Wishlist + Live Cart Badge) -> Editorial Hero -> Featured Collections -> Filterable Product Grid (Quick View + Add to Cart) -> Slide-over Cart Drawer (Qty +/- / Coupon / Subtotal / Checkout Modal) -> Order Tracking, Reviews, FAQ & Footer.
+- Use full-scale modular storefront architecture: Sticky Header (Search + Multi-Page Nav + Wishlist + Account/Sign-In + Live Cart Badge) -> Editorial Hero -> Featured Collections -> Filterable Product Grid (Quick View + Add to Cart) -> Slide-over Cart Drawer (Qty +/- / Coupon / Subtotal / Checkout Modal) -> Order Tracking persisted via Code-Matched Firebase Backend (\`firebaseBackend.ts\` + \`firestore.rules\`), Reviews, FAQ & Footer.
 - Persist cart/wishlist/orders state cleanly and verify every interactive button works without console errors.${modularLayout}`;
   }
 
   if (needsBackend) {
-    return `[VERIFIED LARGE SCAFFOLD BLUEPRINT — FULL-STACK]:
-- Separate contracts cleanly: Shared Types -> Persistence/Store -> Express API Routes (mounted before Vite/static fallback) -> Multi-Page React Views & Components.
-- Validate request bodies, return structured JSON errors, and ensure frontend calls real endpoints.${modularLayout}`;
+    return `[VERIFIED LARGE SCAFFOLD BLUEPRINT — FULL-STACK + FIREBASE]:
+- Separate contracts cleanly: Plan -> Shared Types -> Code-Matched Firebase Backend (\`firebase-blueprint.json\`, \`firestore.rules\`, \`src/services/firebaseBackend.ts\`, \`server/firebaseAdmin.ts\`) -> Express API Routes (mounted before Vite/static fallback) -> Multi-Page React Views & Components.
+- Validate request bodies, return structured JSON errors, and ensure frontend calls real endpoints + \`firebaseBackend\`.${modularLayout}`;
   }
 
   return `[VERIFIED LARGE SCAFFOLD BLUEPRINT — FULL-SCALE MODULAR WEBSITE]:
-- Build a comprehensive multi-page, multi-section production website with rich domain data, responsive mobile/desktop layout, and real interactive React state on every button, filter, tab, modal, and form.${modularLayout}`;
+- Build a comprehensive multi-page, multi-section production website with rich domain data, code-matched Firebase persistence, responsive mobile/desktop layout, and real interactive React state on every button, filter, tab, modal, and form.${modularLayout}`;
 }
 
 // Deterministic Task Checklist for multi-step large website builds
@@ -397,13 +400,13 @@ export function buildDeterministicTaskPlan(promptText: string): string | null {
       /(build|create|implement|fullstack|full-stack|website|dashboard|ecommerce|app|clone|refactor|বানা|তৈরি|ওয়েবসাইট|ওয়েবসাইট|সাইট|ড্যাশবোর্ড|ই-কমার্স)/i.test(lower));
   if (!isComplexBuild) return null;
 
-  return `[MANDATORY HARNESS EXECUTION CHECKLIST — FULL-SCALE MODULAR PIPELINE]:
-Nexus delivers complete, senior-engineer-grade modular websites (target 15–30+ files, 3,500–9,500+ total lines via batched parallel write_to_file calls — ZERO thin demos, ZERO monolithic App.tsx, ZERO single-file projects/*.html):
-1. [Scaffold] Call workspace_init to create workspaces/<sessionId>/ (or inspect existing workspace files if updating).
-2. [Types, Data & Logic] Write rich src/types.ts, src/data/seed.ts, src/data/analytics.ts, src/utils/formatters.ts, and src/hooks/useWorkspaceState.ts (plus server/routes.ts if fullstack).
-3. [10-16+ Modular Components] Batch parallel write_to_file calls (2-4 files per turn, ~200-320 lines each) across src/components/*.tsx (Navbar, HeroSection, StatsStrip, FilterBar, CatalogOrGrid, ItemCard, InteractiveChartPanel, DetailModal, CartOrActionDrawer, TestimonialsSection, FaqAccordion, Footer).
-4. [4-6+ Pages & Router] Build full multi-view pages in src/pages/*.tsx (replacing ALL starter placeholder text) and compose cleanly in src/App.tsx.
-5. [Start & Verify] Call workspace_run(action: "start"), verify_live_preview(targetUrl: "/w/<sessionId>/"), and visual_qa_review(targetUrl: "/w/<sessionId>/"), passing tsc --noEmit, vite build, scale audit, DOM verification, and Browserless visual inspection.`;
+  return `[MANDATORY HARNESS EXECUTION CHECKLIST — GOOGLE AI STUDIO BUILD PIPELINE]:
+Nexus executes the complete systematic pipeline across ALL APIs (target 12–30+ files, 2,500–9,500+ total lines via batched parallel \`write_to_file\` calls — ZERO thin demos, ZERO monolithic App.tsx, ZERO single-file \`projects/*.html\`):
+1. [Plan & Skill Check] Call \`plan(steps: [...])\` + \`read_skill("frontend-design")\` / \`read_skill("firebase-integration")\` before writing app files.
+2. [Scaffold, Types & Data] Call \`workspace_init\` to create \`workspaces/<sessionId>/\`, then write rich \`src/types.ts\`, \`src/data/seed.ts\`, \`src/data/analytics.ts\`.
+3. [Code-Matched Firebase Backend] Call \`set_up_firebase(sessionId, platform: "web", skipInteractivePrompt: true, blueprint: {...})\` matching your \`src/types.ts\` collections/entities -> generates \`firebase-blueprint.json\`, \`firestore.rules\`, \`src/lib/firebase.ts\`, \`src/components/FirebaseProvider.tsx\`, \`src/services/firebaseBackend.ts\` (+ \`server/firebaseAdmin.ts\` if fullstack) -> call \`deploy_firebase(sessionId)\`.
+4. [Hooks, 8-16+ Modular Components & 4-6+ Pages] Batch parallel \`write_to_file\` calls (2-4 files per turn, ~180-320 lines each) across \`src/hooks/useWorkspaceState.ts\` (wired to \`firebaseBackend\`), \`src/components/*.tsx\`, \`src/pages/*.tsx\`, \`src/App.tsx\` (wrapped in \`<FirebaseProvider>\`), plus \`server/routes.ts\` & \`server.ts\` if full-stack.
+5. [Start Session Preview & Verify] Call \`workspace_run(action: "start")\`, \`verify_live_preview(targetUrl: "/w/<sessionId>/")\`, and \`visual_qa_review(targetUrl: "/w/<sessionId>/")\`, passing \`tsc --noEmit\`, \`vite build\`, scale audit, Firebase audit, and DOM verification.`;
 }
 
 // Pre-Flight Context Injector: gives ANY model real dependency graph, installed packages, AST signatures, and scaffold rules

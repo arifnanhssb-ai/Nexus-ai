@@ -78,6 +78,7 @@ export interface ToolExecutionContext {
   llmInvoker?: (systemPrompt: string, userPrompt: string) => Promise<string>;
   onAskQuestion?: (questions: AskQuestionItem[]) => Promise<AskQuestionAnswerPayload>;
   onRequestFirebaseSetup?: (request: FirebaseSetupRequestPayload) => Promise<FirebaseSetupResponsePayload>;
+  allowInteractiveFirebasePrompt?: boolean;
   onAgentStep?: (step: {
     id: string;
     kind: 'agent' | 'thought' | 'qc' | 'command';
@@ -737,7 +738,7 @@ const planTool: FunctionDeclaration = {
 
 const setUpFirebaseTool: FunctionDeclaration = {
   name: "set_up_firebase",
-  description: "Autonomously provisions Firebase Firestore, Auth & Storage inside the active session workspace (or targetDir): generates firebase-blueprint.json, firebase-config.json (auto-inheriting saved Nexus Firebase credentials when available), security-hardened firestore.rules, and src/lib/firebase.ts with OperationType/handleFirestoreError helpers.",
+  description: "Autonomously provisions code-matched Firebase Firestore, Auth & Storage inside the active session workspace (or targetDir): infers entities from src/types.ts when omitted, generates firebase-blueprint.json, firebase-config.json, security-hardened firestore.rules, src/lib/firebase.ts, src/components/FirebaseProvider.tsx, src/services/firebaseBackend.ts, and server/firebaseAdmin.ts (if full-stack).",
   parameters: {
     type: Type.OBJECT,
     properties: {
@@ -757,6 +758,8 @@ const setUpFirebaseTool: FunctionDeclaration = {
       },
       rules: { type: Type.STRING, description: "Optional custom firestore.rules content (otherwise auto-generated from blueprint)." },
       saveToGlobalProfile: { type: Type.BOOLEAN, description: "If true and real credentials are passed, save them globally for future Nexus apps." },
+      skipInteractivePrompt: { type: Type.BOOLEAN, description: "Set true during autonomous website builds so Firebase backend files scaffold immediately without pausing for modal input." },
+      interactive: { type: Type.BOOLEAN, description: "Set true if the user explicitly asked to connect/link a live Firebase account now." },
       userConfirmedTermsAcceptedInUI: { type: Type.BOOLEAN, description: "Whether Firebase provisioning is confirmed." },
     },
     required: ["platform"],
@@ -2612,13 +2615,15 @@ export async function executeServerTool(
 
         let result = await provisionFirebaseForTarget(baseOptions);
 
-        // If no real Firebase credentials are configured yet, pause and prompt the user interactively (like AI Studio)
-        if (
+        // Only pause for interactive Firebase modal when the user explicitly asked to connect Firebase (or args.interactive === true)
+        const shouldPromptInteractive =
           result.requiresUserCredentials &&
-          !args.skipInteractivePrompt &&
+          args.skipInteractivePrompt !== true &&
           args.userConfirmedTermsAcceptedInUI !== false &&
-          execCtx?.onRequestFirebaseSetup
-        ) {
+          Boolean(args.interactive === true || execCtx?.allowInteractiveFirebasePrompt) &&
+          Boolean(execCtx?.onRequestFirebaseSetup);
+
+        if (shouldPromptInteractive && execCtx?.onRequestFirebaseSetup) {
           const collectionPaths = Array.isArray(args.blueprint?.collections)
             ? args.blueprint.collections.map((c: any) => String(c?.path || '')).filter(Boolean)
             : [];
@@ -3107,14 +3112,32 @@ export const ${componentName}: React.FC<${componentName}Props> = ({ className = 
       }
 
       case 'plan': {
-        const steps = Array.isArray(args.steps) ? args.steps : [];
+        const steps = Array.isArray(args.steps)
+          ? args.steps.map((s: any) => (typeof s === 'string' ? s : s?.title || JSON.stringify(s))).filter(Boolean)
+          : [];
         const planDir = path.resolve(process.cwd(), '.nexus_plans');
         await fs.mkdir(planDir, { recursive: true }).catch(() => {});
-        const safeSess = (execCtx?.sessionId || 'default').replace(/[^a-zA-Z0-9_-]/g, '_');
+        const safeSess = (execCtx?.sessionId || 'default').replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 64);
         const planPath = path.join(planDir, `${safeSess}.json`);
+        const mdPath = path.join(planDir, `${safeSess}.md`);
         const planData = { sessionId: safeSess, updatedAt: Date.now(), steps };
+        const mdContent = `# Implementation Plan (${safeSess})\n\n${steps.map((st: string, i: number) => `${i + 1}. [ ] ${st}`).join('\n')}\n`;
         await fs.writeFile(planPath, JSON.stringify(planData, null, 2), 'utf-8').catch(() => {});
-        return { success: true, planFile: `.nexus_plans/${safeSess}.json`, steps, message: `Implementation plan persisted (${steps.length} steps).` };
+        await fs.writeFile(mdPath, mdContent, 'utf-8').catch(() => {});
+
+        const wsDir = path.resolve(process.cwd(), 'workspaces', safeSess);
+        const wsExists = await fs.access(wsDir).then(() => true).catch(() => false);
+        if (wsExists) {
+          await fs.writeFile(path.join(wsDir, 'IMPLEMENTATION_PLAN.md'), mdContent, 'utf-8').catch(() => {});
+        }
+        onAction?.(`📋 Plan created (${steps.length} steps): ${steps.slice(0, 3).join(' → ')}`);
+        return {
+          success: true,
+          planFile: `.nexus_plans/${safeSess}.json`,
+          markdownPlanFile: `.nexus_plans/${safeSess}.md`,
+          steps,
+          message: `Implementation plan persisted (${steps.length} steps). Proceed immediately to workspace_init and parallel batched write_to_file implementation.`,
+        };
       }
 
       default:

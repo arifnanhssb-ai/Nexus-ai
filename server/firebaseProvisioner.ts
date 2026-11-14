@@ -944,6 +944,661 @@ export function useFirebase() {
 `;
 }
 
+function toCamelCase(input: string): string {
+  return String(input || '')
+    .replace(/[^a-zA-Z0-9]+(.)/g, (_, chr) => chr.toUpperCase())
+    .replace(/^[A-Z]/, (c) => c.toLowerCase()) || 'item';
+}
+
+function toPascalCase(input: string): string {
+  const c = toCamelCase(input);
+  return c.charAt(0).toUpperCase() + c.slice(1);
+}
+
+function pluralizeName(singular: string): string {
+  const lower = singular.toLowerCase();
+  if (lower.endsWith('s')) return lower;
+  if (lower.endsWith('y') && !/[aeiou]y$/i.test(lower)) return `${lower.slice(0, -1)}ies`;
+  return `${lower}s`;
+}
+
+function inferCollectionAccess(entityName: string, fieldNames: string[]): {
+  access: BlueprintCollectionSpec['access'];
+  ownerField: string;
+} {
+  const lower = entityName.toLowerCase();
+  const hasOwnerField = fieldNames.find((f) => /^(userId|ownerId|authorId|uid|customerId|createdBy)$/i.test(f));
+  const ownerField = hasOwnerField || 'userId';
+
+  if (/(admin|audit|config|setting|role)/i.test(lower) && !/user/i.test(lower)) {
+    return { access: 'authenticated', ownerField };
+  }
+  if (/(product|catalog|item|course|post|article|blog|service|menu|event|project|listing|property|template|plan|faq|testimonial|category|review)/i.test(lower)) {
+    return { access: 'public_read_auth_write', ownerField };
+  }
+  if (/(message|chat|comment|thread|channel|room)/i.test(lower)) {
+    return { access: 'authenticated', ownerField };
+  }
+  return { access: 'owner', ownerField };
+}
+
+export async function inferBlueprintFromWorkspace(
+  targetDir: string,
+  appNameHint?: string
+): Promise<FirebaseBlueprint> {
+  const candidateFiles = [
+    path.join(targetDir, 'src/types.ts'),
+    path.join(targetDir, 'src/types/index.ts'),
+    path.join(targetDir, 'src/data/seed.ts'),
+    path.join(targetDir, 'server/routes.ts'),
+  ];
+
+  const entities: FirebaseBlueprint['entities'] = {};
+  const collections: BlueprintCollectionSpec[] = [];
+  const seenCollectionPaths = new Set<string>();
+
+  for (const fp of candidateFiles) {
+    const raw = await fs.readFile(fp, 'utf-8').catch(() => '');
+    if (!raw.trim()) continue;
+
+    // Parse exported TypeScript interfaces / object types
+    const ifaceRegex = /export\s+(?:interface|type)\s+([A-Z][A-Za-z0-9_]*)\s*(?:=\s*)?\{([\s\S]*?)\n\}/g;
+    let match: RegExpExecArray | null;
+    while ((match = ifaceRegex.exec(raw)) !== null) {
+      const entityName = match[1];
+      if (/(Props|State|Context|Tab|Filter|Sort|Option|Config|Response|Payload|Params)$/i.test(entityName)) {
+        continue;
+      }
+      const body = match[2] || '';
+      const requiredFields: string[] = [];
+      const allowedFields: string[] = [];
+      const schema: Record<string, any> = {};
+
+      for (const rawLine of body.split('\n')) {
+        const line = rawLine.trim();
+        if (!line || line.startsWith('//') || line.startsWith('*')) continue;
+        const propMatch = line.match(/^([a-zA-Z_][a-zA-Z0-9_]*)(\?)?\s*:\s*([^;]+)/);
+        if (!propMatch) continue;
+        const propName = propMatch[1];
+        const isOptional = Boolean(propMatch[2]);
+        const propTypeRaw = propMatch[3].trim();
+
+        allowedFields.push(propName);
+        if (!isOptional && propName !== 'id') {
+          requiredFields.push(propName);
+        }
+        schema[propName] = {
+          type: /\[\]|Array</i.test(propTypeRaw)
+            ? 'array'
+            : /\bnumber\b/i.test(propTypeRaw)
+              ? 'number'
+              : /\bboolean\b/i.test(propTypeRaw)
+                ? 'boolean'
+                : 'string',
+        };
+      }
+
+      if (allowedFields.length === 0) continue;
+
+      if (!allowedFields.includes('userId') && !allowedFields.includes('ownerId') && !/^User/i.test(entityName)) {
+        allowedFields.push('userId');
+      }
+      if (!allowedFields.includes('createdAt')) allowedFields.push('createdAt');
+      if (!allowedFields.includes('updatedAt')) allowedFields.push('updatedAt');
+
+      entities[entityName] = {
+        description: `Domain model for ${entityName} inferred from workspace types`,
+        requiredFields: requiredFields.slice(0, 6),
+        allowedFields,
+        schema,
+      };
+
+      const isUserEntity = /^User(Profile)?$/i.test(entityName);
+      const colKey = isUserEntity ? 'users' : pluralizeName(toCamelCase(entityName));
+      const paramName = isUserEntity ? 'userId' : `${toCamelCase(entityName)}Id`;
+      const colPath = `/${colKey}/{${paramName}}`;
+
+      if (!seenCollectionPaths.has(colPath)) {
+        seenCollectionPaths.add(colPath);
+        const inferred = inferCollectionAccess(entityName, allowedFields);
+        collections.push({
+          path: colPath,
+          entity: entityName,
+          access: isUserEntity ? 'owner' : inferred.access,
+          ownerField: isUserEntity ? 'uid' : inferred.ownerField,
+          description: `Firestore collection for ${entityName} records`,
+        });
+      }
+    }
+
+    // Also inspect Express REST routes like app.get('/api/orders', ...) if no interface matched
+    const routeRegex = /\.(?:get|post|put|patch|delete)\(\s*['"]\/(?:api\/)?([a-zA-Z][a-zA-Z0-9_-]{1,30})(?:\/:[^'"]+)?['"]/g;
+    let rMatch: RegExpExecArray | null;
+    while ((rMatch = routeRegex.exec(raw)) !== null) {
+      const routeCol = rMatch[1].toLowerCase();
+      if (['health', 'status', 'auth', 'login', 'logout'].includes(routeCol)) continue;
+      const singular = routeCol.endsWith('ies')
+        ? `${routeCol.slice(0, -3)}y`
+        : routeCol.endsWith('s')
+          ? routeCol.slice(0, -1)
+          : routeCol;
+      const entityName = toPascalCase(singular);
+      const colPath = `/${routeCol}/{${toCamelCase(singular)}Id}`;
+      if (!seenCollectionPaths.has(colPath)) {
+        seenCollectionPaths.add(colPath);
+        if (!entities[entityName]) {
+          entities[entityName] = {
+            description: `API-backed ${entityName} entity`,
+            requiredFields: ['userId'],
+            allowedFields: ['id', 'userId', 'title', 'name', 'status', 'data', 'createdAt', 'updatedAt'],
+          };
+        }
+        const inferred = inferCollectionAccess(entityName, entities[entityName].allowedFields || []);
+        collections.push({
+          path: colPath,
+          entity: entityName,
+          access: inferred.access,
+          ownerField: inferred.ownerField,
+          description: `Firestore collection synced with /api/${routeCol}`,
+        });
+      }
+    }
+  }
+
+  // Always ensure User entity & /users/{userId} exist
+  if (!entities.User) {
+    entities.User = {
+      description: 'Authenticated user profile',
+      requiredFields: ['uid', 'email'],
+      allowedFields: ['uid', 'email', 'displayName', 'photoURL', 'role', 'createdAt', 'updatedAt'],
+    };
+  }
+  if (!collections.some((c) => /^\/?users(\/|$)/i.test(c.path))) {
+    collections.unshift({
+      path: '/users/{userId}',
+      entity: 'User',
+      access: 'owner',
+      ownerField: 'uid',
+      description: 'Private user profiles',
+    });
+  }
+
+  if (collections.length <= 1 && !entities.WorkspaceRecord) {
+    entities.WorkspaceRecord = {
+      description: 'Primary application record',
+      requiredFields: ['title', 'userId'],
+      allowedFields: ['id', 'title', 'description', 'category', 'status', 'payload', 'userId', 'createdAt', 'updatedAt'],
+    };
+    collections.push({
+      path: '/records/{recordId}',
+      entity: 'WorkspaceRecord',
+      access: 'owner',
+      ownerField: 'userId',
+      description: 'Persistent application records',
+    });
+  }
+
+  return {
+    appName: appNameHint || 'Nexus Firebase App',
+    entities,
+    collections,
+    authProviders: ['google', 'email_password'],
+    updatedAt: Date.now(),
+  };
+}
+
+export function buildFirebaseBackendServiceModule(blueprint: FirebaseBlueprint): string {
+  const collections = Array.isArray(blueprint.collections) ? blueprint.collections : [];
+  const entities = blueprint.entities || {};
+
+  const entityInterfaces = Object.entries(entities)
+    .map(([name, def]) => {
+      const schema = def?.schema || {};
+      const fields = Array.from(new Set([...(def?.allowedFields || []), ...(def?.requiredFields || [])]));
+      const props = fields
+        .filter((f) => f !== 'id')
+        .map((f) => {
+          const t = schema?.[f]?.type === 'number'
+            ? 'number'
+            : schema?.[f]?.type === 'boolean'
+              ? 'boolean'
+              : schema?.[f]?.type === 'array'
+                ? 'any[]'
+                : 'string';
+          const opt = def?.requiredFields?.includes(f) ? '' : '?';
+          return `  ${f}${opt}: ${t};`;
+        });
+      return `export interface ${name}Record {\n  id?: string;\n${props.join('\n') || '  [key: string]: any;'}\n  [key: string]: any;\n}`;
+    })
+    .join('\n\n');
+
+  const collectionEntries = collections
+    .map((col) => {
+      const cleanPath = String(col.path || '').replace(/^\/+/, '');
+      const rootCollection = cleanPath.split('/')[0] || 'items';
+      const entityName = toPascalCase(col.entity || rootCollection);
+      const recordType = entities[col.entity] ? `${col.entity}Record` : 'Record<string, any>';
+      const ownerField = col.ownerField || 'userId';
+      const fnSuffix = toPascalCase(rootCollection);
+      const singularSuffix = toPascalCase(
+        rootCollection.endsWith('ies')
+          ? `${rootCollection.slice(0, -3)}y`
+          : rootCollection.endsWith('s')
+            ? rootCollection.slice(0, -1)
+            : rootCollection
+      );
+
+      if (rootCollection === 'users') {
+        return `  // Collection: /users/{userId}
+  users: {
+    path: 'users',
+    getById: (uid: string) => getDocument<${recordType}>('users', uid),
+    upsert: (uid: string, data: Partial<${recordType}>) => upsertDocument<${recordType}>('users', uid, data, '${ownerField}'),
+  },`;
+      }
+
+      return `  // Collection: ${col.path} (${col.access || 'owner'})
+  ${toCamelCase(rootCollection)}: {
+    path: '${rootCollection}',
+    subscribe: (
+      onData: (rows: Array<${recordType} & { id: string }>) => void,
+      options?: { ownerOnly?: boolean; limitCount?: number; onError?: (err: Error) => void }
+    ) => subscribeToCollection<${recordType}>('${rootCollection}', onData, { ...options, ownerField: '${ownerField}' }),
+    list: (ownerOnly = ${col.access === 'owner'}) =>
+      listCollectionDocs<${recordType}>('${rootCollection}', { ownerOnly, ownerField: '${ownerField}' }),
+    getById: (id: string) => getDocument<${recordType}>('${rootCollection}', id),
+    create: (data: Omit<${recordType}, 'id'>) =>
+      createDocument<${recordType}>('${rootCollection}', data, '${ownerField}'),
+    update: (id: string, patch: Partial<${recordType}>) =>
+      updateDocument<${recordType}>('${rootCollection}', id, patch),
+    remove: (id: string) => deleteDocument('${rootCollection}', id),
+  },
+  // Named convenience aliases for ${entityName}
+  list${fnSuffix}: (ownerOnly = ${col.access === 'owner'}) =>
+    listCollectionDocs<${recordType}>('${rootCollection}', { ownerOnly, ownerField: '${ownerField}' }),
+  subscribe${fnSuffix}: (
+    onData: (rows: Array<${recordType} & { id: string }>) => void,
+    options?: { ownerOnly?: boolean; limitCount?: number; onError?: (err: Error) => void }
+  ) => subscribeToCollection<${recordType}>('${rootCollection}', onData, { ...options, ownerField: '${ownerField}' }),
+  create${singularSuffix}: (data: Omit<${recordType}, 'id'>) =>
+    createDocument<${recordType}>('${rootCollection}', data, '${ownerField}'),
+  update${singularSuffix}: (id: string, patch: Partial<${recordType}>) =>
+    updateDocument<${recordType}>('${rootCollection}', id, patch),
+  delete${singularSuffix}: (id: string) =>
+    deleteDocument('${rootCollection}', id),`;
+    })
+    .join('\n\n');
+
+  return `// Auto-generated Code-Matched Firebase Backend Service (synced with firebase-blueprint.json)
+import {
+  addDoc,
+  collection,
+  deleteDoc,
+  doc,
+  getDoc,
+  getDocs,
+  limit,
+  onSnapshot,
+  orderBy,
+  query,
+  serverTimestamp,
+  setDoc,
+  updateDoc,
+  where,
+  type QueryConstraint,
+} from 'firebase/firestore';
+import type { User } from 'firebase/auth';
+import {
+  auth,
+  db,
+  handleFirestoreError,
+  isFirebaseConfigured,
+  OperationType,
+} from '../lib/firebase';
+
+${entityInterfaces}
+
+const LOCAL_EVENT_NAME = 'nexus-firebase-local-update';
+
+function readLocalCollection<T = Record<string, any>>(colPath: string): Array<T & { id: string }> {
+  try {
+    const raw = localStorage.getItem(\`nexus_fb_\${colPath}\`);
+    const parsed = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeLocalCollection<T = Record<string, any>>(colPath: string, rows: Array<T & { id: string }>): void {
+  try {
+    localStorage.setItem(\`nexus_fb_\${colPath}\`, JSON.stringify(rows));
+    window.dispatchEvent(new CustomEvent(LOCAL_EVENT_NAME, { detail: { colPath } }));
+  } catch {}
+}
+
+export async function syncUserProfile(user: User | null): Promise<void> {
+  if (!user) return;
+  const payload = {
+    uid: user.uid,
+    email: user.email || '',
+    displayName: user.displayName || user.email?.split('@')[0] || 'Member',
+    photoURL: user.photoURL || '',
+    role: 'user',
+    updatedAt: new Date().toISOString(),
+  };
+  if (!isFirebaseConfigured) {
+    const rows = readLocalCollection('users');
+    const next = [...rows.filter((r) => r.id !== user.uid), { id: user.uid, ...payload }];
+    writeLocalCollection('users', next);
+    return;
+  }
+  try {
+    const ref = doc(db, 'users', user.uid);
+    const snap = await getDoc(ref);
+    await setDoc(
+      ref,
+      {
+        ...payload,
+        ...(snap.exists() ? {} : { createdAt: serverTimestamp() }),
+        updatedAt: serverTimestamp(),
+      },
+      { merge: true }
+    );
+  } catch (err) {
+    handleFirestoreError(err, OperationType.WRITE, \`users/\${user.uid}\`);
+  }
+}
+
+export async function listCollectionDocs<T = Record<string, any>>(
+  colPath: string,
+  options: { ownerOnly?: boolean; ownerField?: string; limitCount?: number } = {}
+): Promise<Array<T & { id: string }>> {
+  if (!isFirebaseConfigured) {
+    return readLocalCollection<T>(colPath);
+  }
+  const ownerField = options.ownerField || 'userId';
+  const uid = auth.currentUser?.uid;
+  if (options.ownerOnly && !uid) return [];
+
+  try {
+    const constraints: QueryConstraint[] = [];
+    if (options.ownerOnly && uid) {
+      constraints.push(where(ownerField, '==', uid));
+    }
+    if (options.limitCount) {
+      constraints.push(limit(options.limitCount));
+    }
+    const q = constraints.length > 0 ? query(collection(db, colPath), ...constraints) : collection(db, colPath);
+    const snap = await getDocs(q);
+    return snap.docs.map((d) => ({ id: d.id, ...(d.data() as T) }));
+  } catch (err) {
+    handleFirestoreError(err, OperationType.LIST, colPath);
+  }
+}
+
+export function subscribeToCollection<T = Record<string, any>>(
+  colPath: string,
+  onData: (rows: Array<T & { id: string }>) => void,
+  options: {
+    ownerOnly?: boolean;
+    ownerField?: string;
+    limitCount?: number;
+    orderByField?: string;
+    onError?: (err: Error) => void;
+  } = {}
+): () => void {
+  if (!isFirebaseConfigured) {
+    onData(readLocalCollection<T>(colPath));
+    const handler = (ev: Event) => {
+      const detail = (ev as CustomEvent)?.detail;
+      if (!detail?.colPath || detail.colPath === colPath) {
+        onData(readLocalCollection<T>(colPath));
+      }
+    };
+    window.addEventListener(LOCAL_EVENT_NAME, handler);
+    return () => window.removeEventListener(LOCAL_EVENT_NAME, handler);
+  }
+
+  const ownerField = options.ownerField || 'userId';
+  const uid = auth.currentUser?.uid;
+  if (options.ownerOnly && !uid) {
+    onData([]);
+    return () => {};
+  }
+
+  const constraints: QueryConstraint[] = [];
+  if (options.ownerOnly && uid) {
+    constraints.push(where(ownerField, '==', uid));
+  }
+  if (options.orderByField) {
+    constraints.push(orderBy(options.orderByField, 'desc'));
+  }
+  if (options.limitCount) {
+    constraints.push(limit(options.limitCount));
+  }
+  const q = constraints.length > 0 ? query(collection(db, colPath), ...constraints) : collection(db, colPath);
+
+  return onSnapshot(
+    q,
+    (snapshot) => {
+      const rows = snapshot.docs.map((d) => ({ id: d.id, ...(d.data() as T) }));
+      onData(rows);
+    },
+    (error) => {
+      try {
+        handleFirestoreError(error, OperationType.LIST, colPath);
+      } catch (wrappedErr: any) {
+        options.onError?.(wrappedErr);
+      }
+    }
+  );
+}
+
+export async function getDocument<T = Record<string, any>>(
+  colPath: string,
+  id: string
+): Promise<(T & { id: string }) | null> {
+  if (!isFirebaseConfigured) {
+    return readLocalCollection<T>(colPath).find((r) => r.id === id) || null;
+  }
+  try {
+    const snap = await getDoc(doc(db, colPath, id));
+    return snap.exists() ? ({ id: snap.id, ...(snap.data() as T) }) : null;
+  } catch (err) {
+    handleFirestoreError(err, OperationType.GET, \`\${colPath}/\${id}\`);
+  }
+}
+
+export async function createDocument<T = Record<string, any>>(
+  colPath: string,
+  data: Omit<T, 'id'>,
+  ownerField = 'userId'
+): Promise<T & { id: string }> {
+  const uid = auth.currentUser?.uid || 'local-user';
+  const basePayload: Record<string, any> = {
+    ...(data as Record<string, any>),
+    [ownerField]: (data as Record<string, any>)[ownerField] || uid,
+  };
+
+  if (!isFirebaseConfigured) {
+    const id = \`local_\${Date.now()}_\${Math.random().toString(36).slice(2, 7)}\`;
+    const record = {
+      id,
+      ...basePayload,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    } as unknown as T & { id: string };
+    const rows = readLocalCollection<T>(colPath);
+    writeLocalCollection(colPath, [record, ...rows]);
+    return record;
+  }
+
+  try {
+    const docRef = await addDoc(collection(db, colPath), {
+      ...basePayload,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+    return { id: docRef.id, ...basePayload } as unknown as T & { id: string };
+  } catch (err) {
+    handleFirestoreError(err, OperationType.CREATE, colPath);
+  }
+}
+
+export async function upsertDocument<T = Record<string, any>>(
+  colPath: string,
+  id: string,
+  data: Partial<T>,
+  ownerField = 'userId'
+): Promise<void> {
+  const uid = auth.currentUser?.uid || 'local-user';
+  const payload: Record<string, any> = {
+    ...(data as Record<string, any>),
+    [ownerField]: (data as Record<string, any>)[ownerField] || uid,
+  };
+  if (!isFirebaseConfigured) {
+    const rows = readLocalCollection<T>(colPath);
+    const existing = rows.find((r) => r.id === id);
+    const updated = {
+      ...(existing || {}),
+      id,
+      ...payload,
+      updatedAt: new Date().toISOString(),
+    } as unknown as T & { id: string };
+    writeLocalCollection(colPath, [updated, ...rows.filter((r) => r.id !== id)]);
+    return;
+  }
+  try {
+    await setDoc(
+      doc(db, colPath, id),
+      { ...payload, updatedAt: serverTimestamp() },
+      { merge: true }
+    );
+  } catch (err) {
+    handleFirestoreError(err, OperationType.WRITE, \`\${colPath}/\${id}\`);
+  }
+}
+
+export async function updateDocument<T = Record<string, any>>(
+  colPath: string,
+  id: string,
+  patch: Partial<T>
+): Promise<void> {
+  if (!isFirebaseConfigured) {
+    const rows = readLocalCollection<T>(colPath);
+    const next = rows.map((r) =>
+      r.id === id ? { ...r, ...(patch as Record<string, any>), updatedAt: new Date().toISOString() } : r
+    );
+    writeLocalCollection(colPath, next);
+    return;
+  }
+  try {
+    await updateDoc(doc(db, colPath, id), {
+      ...(patch as Record<string, any>),
+      updatedAt: serverTimestamp(),
+    });
+  } catch (err) {
+    handleFirestoreError(err, OperationType.UPDATE, \`\${colPath}/\${id}\`);
+  }
+}
+
+export async function deleteDocument(colPath: string, id: string): Promise<void> {
+  if (!isFirebaseConfigured) {
+    const rows = readLocalCollection(colPath).filter((r) => r.id !== id);
+    writeLocalCollection(colPath, rows);
+    return;
+  }
+  try {
+    await deleteDoc(doc(db, colPath, id));
+  } catch (err) {
+    handleFirestoreError(err, OperationType.DELETE, \`\${colPath}/\${id}\`);
+  }
+}
+
+export const firebaseBackend = {
+  isLive: isFirebaseConfigured,
+  syncUserProfile,
+${collectionEntries}
+};
+
+export default firebaseBackend;
+`;
+}
+
+export function buildServerFirebaseAdminHelper(
+  fbConfig: FirebaseWebConfig,
+  blueprint: FirebaseBlueprint
+): string {
+  const collectionNames = (blueprint.collections || [])
+    .map((c) => String(c.path || '').replace(/^\/+/, '').split('/')[0])
+    .filter(Boolean);
+
+  return `// Auto-generated Server Firebase Auth & Blueprint Guard Helper
+import type { Request, Response, NextFunction } from 'express';
+
+export const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || ${JSON.stringify(fbConfig.projectId)};
+export const FIREBASE_API_KEY = process.env.FIREBASE_API_KEY || ${JSON.stringify(fbConfig.apiKey)};
+export const BLUEPRINT_COLLECTIONS = ${JSON.stringify(Array.from(new Set(collectionNames)))};
+
+export interface VerifiedFirebaseUser {
+  uid: string;
+  email?: string;
+  emailVerified?: boolean;
+  displayName?: string;
+}
+
+export async function verifyFirebaseBearerToken(authHeader?: string): Promise<VerifiedFirebaseUser | null> {
+  if (!authHeader || !authHeader.startsWith('Bearer ')) return null;
+  const idToken = authHeader.slice(7).trim();
+  if (!idToken) return null;
+
+  // Verify token against Identity Toolkit REST API when real API key is configured
+  if (FIREBASE_API_KEY && !FIREBASE_API_KEY.includes('REPLACE_WITH_')) {
+    try {
+      const res = await fetch(
+        \`https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=\${encodeURIComponent(FIREBASE_API_KEY)}\`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ idToken }),
+        }
+      );
+      if (res.ok) {
+        const json: any = await res.json().catch(() => null);
+        const u = json?.users?.[0];
+        if (u?.localId) {
+          return {
+            uid: u.localId,
+            email: u.email,
+            emailVerified: Boolean(u.emailVerified),
+            displayName: u.displayName,
+          };
+        }
+      }
+    } catch {}
+  }
+
+  return null;
+}
+
+export function requireFirebaseAuth(req: Request, res: Response, next: NextFunction) {
+  verifyFirebaseBearerToken(req.headers.authorization)
+    .then((user) => {
+      if (!user) {
+        res.status(401).json({ error: 'Unauthorized: Valid Firebase Bearer ID token required.' });
+        return;
+      }
+      (req as any).firebaseUser = user;
+      next();
+    })
+    .catch(() => {
+      res.status(401).json({ error: 'Unauthorized: Firebase token verification failed.' });
+    });
+}
+`;
+}
+
 export async function provisionFirebaseForTarget(options: {
   sessionId?: string;
   targetDir?: string;
@@ -1053,33 +1708,39 @@ export async function provisionFirebaseForTarget(options: {
   await fs.writeFile(appletConfigPath, JSON.stringify(fbConfig, null, 2), 'utf-8');
   modifiedFiles.push(toRel('firebase-applet-config.json'));
 
-  // 2. Write firebase-blueprint.json
+  // 2. Write code-matched firebase-blueprint.json (merges explicit blueprint with inferred workspace entities/collections)
   const blueprintPath = path.join(targetDir, 'firebase-blueprint.json');
-  let blueprintToWrite: FirebaseBlueprint | null = options.blueprint || null;
-  if (!blueprintToWrite) {
-    const existingBp = await fs.readFile(blueprintPath, 'utf-8').then(JSON.parse).catch(() => null);
-    blueprintToWrite = existingBp || {
-      appName: 'Nexus Firebase App',
-      entities: {
-        User: {
-          description: 'Authenticated user profile',
-          requiredFields: ['uid', 'email'],
-          allowedFields: ['uid', 'email', 'displayName', 'photoURL', 'role', 'createdAt'],
-        },
-      },
+  const inferredBp = await inferBlueprintFromWorkspace(targetDir, options.blueprint?.appName);
+  const existingBp = await fs.readFile(blueprintPath, 'utf-8').then(JSON.parse).catch(() => null);
+  let blueprintToWrite: FirebaseBlueprint;
+  if (options.blueprint && Array.isArray(options.blueprint.collections) && options.blueprint.collections.length > 0) {
+    blueprintToWrite = {
+      ...inferredBp,
+      ...options.blueprint,
+      entities: { ...inferredBp.entities, ...(options.blueprint.entities || {}) },
       collections: [
-        {
-          path: '/users/{userId}',
-          entity: 'User',
-          access: 'owner',
-          description: 'Private user profiles',
-        },
+        ...options.blueprint.collections,
+        ...inferredBp.collections.filter(
+          (ic) => !options.blueprint!.collections.some((ec) => ec.path === ic.path)
+        ),
       ],
-      authProviders: ['google', 'email_password'],
+      updatedAt: Date.now(),
+    };
+  } else if (existingBp && Array.isArray(existingBp.collections) && existingBp.collections.length > 1) {
+    blueprintToWrite = {
+      ...inferredBp,
+      ...existingBp,
+      entities: { ...inferredBp.entities, ...(existingBp.entities || {}) },
+      collections: [
+        ...existingBp.collections,
+        ...inferredBp.collections.filter(
+          (ic) => !existingBp.collections.some((ec: any) => ec.path === ic.path)
+        ),
+      ],
       updatedAt: Date.now(),
     };
   } else {
-    blueprintToWrite = { ...blueprintToWrite, updatedAt: Date.now() };
+    blueprintToWrite = inferredBp;
   }
   await fs.writeFile(blueprintPath, JSON.stringify(blueprintToWrite, null, 2), 'utf-8');
   modifiedFiles.push(toRel('firebase-blueprint.json'));
@@ -1089,13 +1750,13 @@ export async function provisionFirebaseForTarget(options: {
   const existingRules = await fs.readFile(rulesPath, 'utf-8').catch(() => '');
   const rulesContent = options.rules
     ? options.rules
-    : options.blueprint || !existingRules.trim()
+    : options.blueprint || !existingRules.trim() || blueprintToWrite.collections.length > 1
       ? generateRulesFromBlueprint(blueprintToWrite)
       : existingRules;
   await fs.writeFile(rulesPath, rulesContent, 'utf-8');
   modifiedFiles.push(toRel('firestore.rules'));
 
-  // 4. Write SDK module + FirebaseProvider for React/Vite or JS helper for static-project
+  // 4. Write SDK module, FirebaseProvider, code-matched Domain Backend Service & optional Express helper
   if (kind === 'static-project') {
     const staticHelperPath = path.join(targetDir, 'firebase-client.js');
     const staticHelper = `// Auto-generated by Nexus AI Firebase Provisioner
@@ -1116,6 +1777,23 @@ export const isFirebaseConfigured = ${hasRealCreds};
       await fs.mkdir(path.dirname(providerPath), { recursive: true });
       await fs.writeFile(providerPath, buildFirebaseProviderModule(), 'utf-8');
       modifiedFiles.push(toRel('src/components/FirebaseProvider.tsx'));
+    }
+
+    // Write code-matched Firestore backend CRUD & realtime subscription service synced to blueprint
+    const backendServicePath = path.join(targetDir, 'src/services/firebaseBackend.ts');
+    await fs.mkdir(path.dirname(backendServicePath), { recursive: true });
+    await fs.writeFile(backendServicePath, buildFirebaseBackendServiceModule(blueprintToWrite), 'utf-8');
+    modifiedFiles.push(toRel('src/services/firebaseBackend.ts'));
+
+    // If full-stack Express workspace exists, generate matching server/firebaseAdmin.ts helper
+    const hasServerFile =
+      (await fs.access(path.join(targetDir, 'server.ts')).then(() => true).catch(() => false)) ||
+      (await fs.access(path.join(targetDir, 'server/routes.ts')).then(() => true).catch(() => false));
+    if (hasServerFile && kind === 'workspace') {
+      const serverAdminPath = path.join(targetDir, 'server/firebaseAdmin.ts');
+      await fs.mkdir(path.dirname(serverAdminPath), { recursive: true });
+      await fs.writeFile(serverAdminPath, buildServerFirebaseAdminHelper(fbConfig, blueprintToWrite), 'utf-8');
+      modifiedFiles.push(toRel('server/firebaseAdmin.ts'));
     }
 
     // Ensure package.json in workspace includes firebase dependency
@@ -1148,13 +1826,14 @@ export const isFirebaseConfigured = ${hasRealCreds};
     inheritedFromGlobalProfile: Boolean(profile.autoInject && !options.projectId && hasRealCreds),
     requiresUserCredentials: !hasRealCreds,
     projectId: fbConfig.projectId,
+    inferredCollections: blueprintToWrite.collections.map((c) => c.path),
     rulesAudit: audit,
     deployedRulesRemotely: Boolean(cloudDeployResult?.deployedRemotely),
     modifiedFiles,
     message: hasRealCreds
       ? cloudDeployResult?.deployedRemotely
-        ? `Firebase SDK, blueprint & firestore.rules provisioned in "${relativeRoot || '.'}" and deployed live to "${fbConfig.projectId}".`
-        : `Firebase SDK, blueprint & audited firestore.rules (score ${audit.securityScore}/100) auto-configured for "${fbConfig.projectId}" in "${relativeRoot || '.'}".`
-      : `Firebase blueprint, SDK (src/lib/firebase.ts) & firestore.rules scaffolded in "${relativeRoot || '.'}". Connect a Firebase project once in Firebase Modal (🔥) to auto-inject live credentials across all apps.`,
+        ? `Firebase SDK, code-matched backend (src/services/firebaseBackend.ts), blueprint & firestore.rules provisioned in "${relativeRoot || '.'}" and deployed live to "${fbConfig.projectId}".`
+        : `Firebase SDK, code-matched backend (src/services/firebaseBackend.ts), blueprint & audited firestore.rules (score ${audit.securityScore}/100) auto-configured for "${fbConfig.projectId}" in "${relativeRoot || '.'}".`
+      : `Code-matched Firebase backend (src/services/firebaseBackend.ts, src/lib/firebase.ts, FirebaseProvider, firebase-blueprint.json & firestore.rules) scaffolded in "${relativeRoot || '.'}" with local preview persistence. Connect a Firebase project anytime in Firebase Modal (🔥).`,
   };
 }
