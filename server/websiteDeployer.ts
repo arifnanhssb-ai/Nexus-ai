@@ -181,7 +181,7 @@ Phase 6: Scannable Structured Reporting
 
 export function inferWebsiteDesignBrief(promptText: string, sessionId?: string): string | null {
   const lower = (promptText || '').toLowerCase();
-  const isRepoOrInternal = /(gh\s+repo\s+clone|server\/apiOrchestrator|src\/components\/GoogleAIStudioCoderView)/i.test(lower);
+  const isRepoOrInternal = /(gh\s+repo\s+clone|git\s+clone|github\.com\/|ক্লোন|server\/apiOrchestrator|src\/components\/GoogleAIStudioCoderView)/i.test(lower);
   const isWebsiteRequest = !isRepoOrInternal && /(website|web\s*app|landing\s*page|ecommerce|e-commerce|store|shop|dashboard|portfolio|saas|agency|blog|restaurant|cafe|hospital|clinic|school|lms|game|pwa|redesign|portal|platform|site|ui|ওয়েবসাইট|ওয়েবসাইট|সাইট|ল্যান্ডিং|পোর্টফোলিও|ড্যাশবোর্ড|ই-কমার্স|দোকান|স্টোর|অ্যাপ|গেম|প্ল্যাটফর্ম|পোর্টাল)/i.test(lower);
   if (!isWebsiteRequest) return null;
 

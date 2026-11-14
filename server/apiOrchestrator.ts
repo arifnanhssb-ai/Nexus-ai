@@ -12,6 +12,7 @@ import { loadSecretsFromPersistence, saveSecretsToPersistence } from "./persiste
 import { runVisualQaReview } from "./visualQa.ts";
 import {
   buildHarnessPreFlightContext,
+  isGitHubClonePrompt,
   lookupErrorKnowledgeBase,
   recordErrorFixResolution,
   runCrossModelCritic,
@@ -865,6 +866,9 @@ function mapToolToActionStep(toolName: string, args: any): { kind: ActionStepKin
   } else if (toolName === 'workspace_run') {
     kind = 'restart';
     label = `Sandbox sub-server (${args?.action || 'start'})`;
+  } else if (toolName === 'github_clone') {
+    kind = 'build';
+    label = `Cloned GitHub repo (${args?.repo || 'repo'})`;
   } else if (toolName === 'ast_context_ranker') {
     kind = 'read';
     label = 'Analyzed AST symbol & call graph';
@@ -1021,6 +1025,22 @@ async function executeToolWithLiveEvents(
         sessionId: execCtx.sessionId,
         timestamp: Date.now(),
       });
+    } else if (callName === 'github_clone' && toolResult?.success && toolResult?.proxyUrl) {
+      const srvOk = !toolResult?.serverStatus || toolResult?.serverStatus?.success !== false;
+      sendEvent({
+        type: "action",
+        action: srvOk
+          ? `✓ Cloned ${toolResult.repo} & live preview ready at ${toolResult.proxyUrl}`
+          : `✓ Cloned ${toolResult.repo} into ${toolResult.workspacePath}`,
+      });
+      if (srvOk) {
+        sendEvent({
+          type: "preview_ready",
+          url: toolResult.proxyUrl,
+          sessionId: execCtx.sessionId,
+          timestamp: Date.now(),
+        });
+      }
     }
   }
 
@@ -1079,6 +1099,7 @@ const OPENAI_CORE_TOOL_NAMES = new Set([
   'code_execution_sandbox',
   'workspace_init',
   'workspace_run',
+  'github_clone',
   'visual_qa_review',
   'persistence_status',
   'set_up_firebase',
@@ -1125,7 +1146,7 @@ function selectRelevantTools(
   ]);
 
   const lower = (promptText || '').toLowerCase();
-  if (/(install|package|npm|react|express|server|backend|api|build|typescript|vite|clone|repo|sandbox|workspace|fullstack|ফুল-স্ট্যাক)/i.test(lower)) {
+  if (/(install|package|npm|react|express|server|backend|api|build|typescript|vite|clone|repo|github|gh\s+repo|sandbox|workspace|fullstack|ফুল-স্ট্যাক|ক্লোন|রিপো|গিটহাব|প্রিভিউ)/i.test(lower)) {
     baseTools.add('analyze_project');
     baseTools.add('find_by_name');
     baseTools.add('install_applet_package');
@@ -1136,6 +1157,7 @@ function selectRelevantTools(
     baseTools.add('run_tests');
     baseTools.add('workspace_init');
     baseTools.add('workspace_run');
+    baseTools.add('github_clone');
   }
   if (/(delete|remove|rename|move|clean|মুছ|সরাও)/i.test(lower)) {
     baseTools.add('delete_file');
@@ -1844,8 +1866,12 @@ async function runMandatorySelfHealingGate(
         }
       }
 
-      // Large Website Completeness & Scale Audit: ensure new websites are comprehensive 10-30+ file builds
-      if (isModularWebsiteTask) {
+      const isClonedRepoTask =
+        isGitHubClonePrompt(harnessCtx?.originalPrompt || '') ||
+        Boolean(harnessCtx?.sharedProgress?.executedTools?.includes('github_clone'));
+
+      // Large Website Completeness & Scale Audit: ensure new websites are comprehensive 10-30+ file builds (skip for cloned GitHub repos)
+      if (isModularWebsiteTask && !isClonedRepoTask) {
         const wsAudit = await auditLargeModularWorkspace(wsDir);
         const isFreshInit = Boolean(harnessCtx?.sharedProgress?.executedTools?.includes('workspace_init'));
         const isMassiveScaleRequest = /(5000|10000|5,000|10,000|5k|10k|৫\s*হাজার|১০\s*হাজার|পুর্নাঙ্গ|পূর্ণাঙ্গ|mega|enterprise|full-?scale)/i.test(
@@ -2461,6 +2487,10 @@ The server will execute it immediately and send back the result so you can conti
             if (tf) sharedProgress?.mutatedFiles.add(String(tf));
           }
           const toolResult = await executeToolWithLiveEvents(tc.function.name, parsedArgs, sendEvent, execCtx);
+          if (tc.function.name === 'github_clone' && toolResult?.success && toolResult?.workspacePath) {
+            didMutateFiles = true;
+            sharedProgress?.mutatedFiles.add(`${toolResult.workspacePath}/.nexus_cloned`);
+          }
           return {
             role: 'tool',
             tool_call_id: tc.id,
@@ -2488,6 +2518,10 @@ The server will execute it immediately and send back the result so you can conti
           if (tf) sharedProgress?.mutatedFiles.add(String(tf));
         }
         const toolResult = await executeToolWithLiveEvents(tc.name, tc.args, sendEvent, execCtx);
+        if (tc.name === 'github_clone' && toolResult?.success && toolResult?.workspacePath) {
+          didMutateFiles = true;
+          sharedProgress?.mutatedFiles.add(`${toolResult.workspacePath}/.nexus_cloned`);
+        }
         resultSummaries.push({ tool: tc.name, result: toolResult });
       }
       openAiMessages.push({
@@ -2998,6 +3032,10 @@ async function runGeminiAgentLoop(
             if (tf) sharedProgress?.mutatedFiles.add(String(tf));
           }
           const toolResult = await executeToolWithLiveEvents(call.name, call.args, sendEvent, execCtx);
+          if (call.name === 'github_clone' && toolResult?.success && toolResult?.workspacePath) {
+            didMutateFiles = true;
+            sharedProgress?.mutatedFiles.add(`${toolResult.workspacePath}/.nexus_cloned`);
+          }
           return {
             functionResponse: {
               ...(call.id ? { id: call.id } : {}),
@@ -3025,6 +3063,10 @@ async function runGeminiAgentLoop(
           if (tf) sharedProgress?.mutatedFiles.add(String(tf));
         }
         const toolResult = await executeToolWithLiveEvents(tc.name, tc.args, sendEvent, execCtx);
+        if (tc.name === 'github_clone' && toolResult?.success && toolResult?.workspacePath) {
+          didMutateFiles = true;
+          sharedProgress?.mutatedFiles.add(`${toolResult.workspacePath}/.nexus_cloned`);
+        }
         results.push({ tool: tc.name, result: toolResult });
       }
       if (sharedProgress) sharedProgress.committedText = committedText;

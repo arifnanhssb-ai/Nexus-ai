@@ -1,9 +1,13 @@
 import fs from 'fs/promises';
 import path from 'path';
 import net from 'net';
-import { spawn, type ChildProcess } from 'child_process';
+import { exec, spawn, type ChildProcess } from 'child_process';
+import { promisify } from 'util';
+import { transformSync } from 'esbuild';
 import type { Request, Response } from 'express';
 import { NEXUS_PREVIEW_BRIDGE_SCRIPT } from './websiteDeployer.ts';
+
+const execPromise = promisify(exec);
 
 export type WorkspaceTemplate = 'static' | 'react-vite' | 'fullstack-express';
 
@@ -430,6 +434,274 @@ boot();
   };
 }
 
+export function normalizeGitHubRepoSpec(rawInput: string): {
+  owner: string;
+  repo: string;
+  cloneUrl: string;
+  slug: string;
+} | null {
+  let s = (rawInput || '').trim();
+  s = s.replace(/^(?:gh\s+repo\s+clone|git\s+clone)\s+/i, '').trim();
+  s = s.replace(/^["']|["']$/g, '').split(/\s+/)[0] || '';
+  s = s.replace(/\.git$/i, '').replace(/\/+$/, '');
+
+  const sshMatch = s.match(/^git@github\.com:([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)$/i);
+  if (sshMatch) {
+    const [, owner, repo] = sshMatch;
+    return { owner, repo, slug: `${owner}/${repo}`, cloneUrl: `https://github.com/${owner}/${repo}.git` };
+  }
+
+  const urlMatch = s.match(/^https?:\/\/(?:www\.)?github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)(?:\/.*)?$/i);
+  if (urlMatch) {
+    const [, owner, repo] = urlMatch;
+    return { owner, repo, slug: `${owner}/${repo}`, cloneUrl: `https://github.com/${owner}/${repo}.git` };
+  }
+
+  const slugMatch = s.match(/^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)$/);
+  if (slugMatch) {
+    const [, owner, repo] = slugMatch;
+    return { owner, repo, slug: `${owner}/${repo}`, cloneUrl: `https://github.com/${owner}/${repo}.git` };
+  }
+
+  return null;
+}
+
+async function ensureWorkspaceDependencies(wsDir: string): Promise<{
+  mode: 'symlink' | 'npm_install' | 'skipped' | 'partial';
+  note: string;
+}> {
+  const wsPkgPath = path.join(wsDir, 'package.json');
+  const wsNodeModules = path.join(wsDir, 'node_modules');
+  const rootNodeModules = path.resolve(process.cwd(), 'node_modules');
+
+  const hasPkg = await fs.access(wsPkgPath).then(() => true).catch(() => false);
+  if (!hasPkg) return { mode: 'skipped', note: 'No package.json (static/non-Node project).' };
+
+  const hasNm = await fs.lstat(wsNodeModules).then(() => true).catch(() => false);
+  if (hasNm) return { mode: 'skipped', note: 'node_modules already present.' };
+
+  try {
+    const rawPkg = await fs.readFile(wsPkgPath, 'utf-8');
+    const pkg = JSON.parse(rawPkg);
+    const allDeps = [
+      ...Object.keys(pkg.dependencies || {}),
+      ...Object.keys(pkg.devDependencies || {}),
+    ];
+
+    const missingInRoot: string[] = [];
+    for (const dep of allDeps) {
+      const existsInRoot = await fs.access(path.join(rootNodeModules, dep)).then(() => true).catch(() => false);
+      if (!existsInRoot) missingInRoot.push(dep);
+    }
+
+    if (missingInRoot.length === 0) {
+      await fs.symlink(rootNodeModules, wsNodeModules, 'dir');
+      return { mode: 'symlink', note: `Instant-linked all ${allDeps.length} dependencies from root node_modules.` };
+    }
+
+    try {
+      await execPromise('npm install --no-audit --no-fund --legacy-peer-deps', {
+        cwd: wsDir,
+        timeout: 90000,
+      });
+      return { mode: 'npm_install', note: `Installed ${allDeps.length} packages via npm install.` };
+    } catch (instErr: any) {
+      await fs.symlink(rootNodeModules, wsNodeModules, 'dir').catch(() => {});
+      return {
+        mode: 'partial',
+        note: `npm install hit an issue (${(instErr?.message || '').slice(0, 140)}); symlinked root node_modules as fallback. Missing: ${missingInRoot.join(', ')}`,
+      };
+    }
+  } catch (err: any) {
+    await fs.symlink(rootNodeModules, wsNodeModules, 'dir').catch(() => {});
+    return { mode: 'partial', note: `Dependency check fallback: ${err?.message || 'symlinked root node_modules'}` };
+  }
+}
+
+async function normalizeClonedWorkspaceForPreview(wsDir: string, safeId: string): Promise<string[]> {
+  const notes: string[] = [];
+
+  // 1. Remove non-npm lockfiles
+  for (const lf of ['bun.lock', 'bun.lockb', 'yarn.lock', 'pnpm-lock.yaml']) {
+    const lp = path.join(wsDir, lf);
+    const exists = await fs.access(lp).then(() => true).catch(() => false);
+    if (exists) {
+      await fs.unlink(lp).catch(() => {});
+      notes.push(`Removed ${lf}`);
+    }
+  }
+
+  // 2. Normalize package.json (convert resolutions -> overrides, drop packageManager/preinstall)
+  const pkgPath = path.join(wsDir, 'package.json');
+  try {
+    const raw = await fs.readFile(pkgPath, 'utf-8');
+    const pkg = JSON.parse(raw);
+    let changed = false;
+    if (pkg.packageManager) {
+      delete pkg.packageManager;
+      changed = true;
+    }
+    if (pkg.scripts?.preinstall) {
+      delete pkg.scripts.preinstall;
+      changed = true;
+    }
+    if (pkg.resolutions && !pkg.overrides) {
+      pkg.overrides = pkg.resolutions;
+      delete pkg.resolutions;
+      changed = true;
+    }
+    if (changed) {
+      await fs.writeFile(pkgPath, JSON.stringify(pkg, null, 2), 'utf-8');
+      notes.push('Normalized package.json for npm');
+    }
+  } catch {}
+
+  // 3. Patch vite.config.(ts|js|mjs) to serve cleanly under /w/<safeId>/ with HMR disabled
+  for (const vFile of ['vite.config.ts', 'vite.config.js', 'vite.config.mjs']) {
+    const vp = path.join(wsDir, vFile);
+    try {
+      const orig = await fs.readFile(vp, 'utf-8');
+      if (!orig.includes(`/w/${safeId}/`)) {
+        let patched = orig;
+        if (!/\bbase\s*:/.test(patched)) {
+          if (/defineConfig\s*\(\s*\([^)]*\)\s*=>\s*\{\s*[\s\S]*?return\s*\{/.test(patched)) {
+            patched = patched.replace(/return\s*\{/, `return {\n    base: '/w/${safeId}/',`);
+          } else if (/defineConfig\s*\(\s*\{/.test(patched)) {
+            patched = patched.replace(/defineConfig\s*\(\s*\{/, `defineConfig({\n  base: '/w/${safeId}/',`);
+          } else if (/export\s+default\s*\{/.test(patched)) {
+            patched = patched.replace(/export\s+default\s*\{/, `export default {\n  base: '/w/${safeId}/',`);
+          }
+        } else {
+          patched = patched.replace(/base\s*:\s*['"][^'"]*['"]/, `base: '/w/${safeId}/'`);
+        }
+
+        if (patched !== orig) {
+          const loader = vFile.endsWith('.ts') ? 'ts' : 'js';
+          transformSync(patched, { loader, logLevel: 'silent' });
+          await fs.writeFile(vp, patched, 'utf-8');
+          notes.push(`Configured ${vFile} base -> /w/${safeId}/`);
+        }
+      }
+      break;
+    } catch {}
+  }
+
+  // 4. Ensure cloned server.ts / server.js respects process.env.PORT (avoid hardcoded 3000 collision) and passes through /w/<safeId>/
+  for (const sFile of ['server.ts', 'server.js']) {
+    const sp = path.join(wsDir, sFile);
+    try {
+      const orig = await fs.readFile(sp, 'utf-8');
+      let patched = orig;
+      if (!/process\.env\.PORT/.test(patched)) {
+        patched = patched
+          .replace(/\b(const|let|var)\s+PORT\s*=\s*3000\b/g, '$1 PORT = Number(process.env.PORT) || 3000')
+          .replace(/\.listen\(\s*3000\b/g, '.listen(Number(process.env.PORT) || 3000');
+      }
+      if (/app\.use\s*\(\s*['"]\/w\/:sessionId['"]\s*,\s*handleWorkspaceProxyRequest\s*\)/.test(patched)) {
+        patched = patched.replace(
+          /app\.use\s*\(\s*['"]\/w\/:sessionId['"]\s*,\s*handleWorkspaceProxyRequest\s*\)/g,
+          `app.use('/w/:sessionId', (req, res, next) => req.params.sessionId === '${safeId}' ? next() : handleWorkspaceProxyRequest(req, res))`
+        );
+      }
+      if (patched !== orig) {
+        const loader = sFile.endsWith('.ts') ? 'ts' : 'js';
+        transformSync(patched, { loader, logLevel: 'silent' });
+        await fs.writeFile(sp, patched, 'utf-8');
+        notes.push(`Patched ${sFile} for sandbox port & /w/${safeId}/ routing`);
+      }
+    } catch {}
+  }
+
+  return notes;
+}
+
+export async function cloneGitHubRepoToWorkspace(options: {
+  repo: string;
+  sessionId?: string;
+  branch?: string;
+  autoStart?: boolean;
+}): Promise<{
+  success: boolean;
+  repo?: string;
+  cloneUrl?: string;
+  sessionId: string;
+  workspacePath: string;
+  proxyUrl: string;
+  files?: string[];
+  migrationNotes?: string[];
+  dependencyStatus?: { mode: string; note: string };
+  serverStatus?: any;
+  error?: string;
+}> {
+  const safeId = sanitizeSessionId(options.sessionId || 'default');
+  const wsDir = getWorkspaceDir(safeId);
+  const proxyUrl = `/w/${safeId}/`;
+
+  const parsed = normalizeGitHubRepoSpec(options.repo);
+  if (!parsed) {
+    return {
+      success: false,
+      sessionId: safeId,
+      workspacePath: `workspaces/${safeId}`,
+      proxyUrl,
+      error: `Invalid GitHub repository format: "${options.repo}". Expected "owner/repo" or "https://github.com/owner/repo".`,
+    };
+  }
+
+  await stopWorkspaceServer(safeId).catch(() => {});
+  await fs.rm(wsDir, { recursive: true, force: true }).catch(() => {});
+  await fs.mkdir(path.dirname(wsDir), { recursive: true });
+
+  const branchFlag = options.branch ? ` --branch "${options.branch.replace(/[^A-Za-z0-9_./-]/g, '')}"` : '';
+  const token = process.env.GITHUB_TOKEN?.trim();
+  const authPrefix = token
+    ? `-c http.https://github.com/.extraheader="AUTHORIZATION: basic ${Buffer.from(`x-access-token:${token}`).toString('base64')}" `
+    : '';
+  const gitCmd = `git ${authPrefix}clone --depth 1${branchFlag} "${parsed.cloneUrl}" "${wsDir}"`;
+
+  try {
+    await execPromise(gitCmd, { cwd: process.cwd(), timeout: 60000 });
+  } catch (cloneErr: any) {
+    const cleanErr = String(cloneErr?.stderr || cloneErr?.message || 'Git clone failed').replace(/AUTHORIZATION: basic [A-Za-z0-9+/=]+/gi, 'AUTHORIZATION: ***');
+    return {
+      success: false,
+      repo: parsed.slug,
+      cloneUrl: parsed.cloneUrl,
+      sessionId: safeId,
+      workspacePath: `workspaces/${safeId}`,
+      proxyUrl,
+      error: cleanErr.slice(0, 1200),
+    };
+  }
+
+  const migrationNotes = await normalizeClonedWorkspaceForPreview(wsDir, safeId);
+  const dependencyStatus = await ensureWorkspaceDependencies(wsDir);
+
+  const topEntries = await fs.readdir(wsDir, { withFileTypes: true }).catch(() => []);
+  const files = topEntries
+    .filter((e) => e.name !== '.git' && e.name !== 'node_modules')
+    .map((e) => (e.isDirectory() ? `${e.name}/` : e.name))
+    .slice(0, 40);
+
+  let serverStatus: any = undefined;
+  if (options.autoStart !== false) {
+    serverStatus = await startWorkspaceServer(safeId);
+  }
+
+  return {
+    success: true,
+    repo: parsed.slug,
+    cloneUrl: parsed.cloneUrl,
+    sessionId: safeId,
+    workspacePath: `workspaces/${safeId}`,
+    proxyUrl,
+    files,
+    migrationNotes,
+    dependencyStatus,
+    serverStatus,
+  };
+}
+
 export async function startWorkspaceServer(
   sessionId: string = 'default',
   customCommand?: string
@@ -495,7 +767,14 @@ async function startWorkspaceServerInternal(
 
   const hasServerTs = await fs.access(path.join(wsDir, 'server.ts')).then(() => true).catch(() => false);
   const hasServerJs = await fs.access(path.join(wsDir, 'server.js')).then(() => true).catch(() => false);
-  const hasVite = await fs.access(path.join(wsDir, 'vite.config.ts')).then(() => true).catch(() => false);
+  const hasVite =
+    (await fs.access(path.join(wsDir, 'vite.config.ts')).then(() => true).catch(() => false)) ||
+    (await fs.access(path.join(wsDir, 'vite.config.js')).then(() => true).catch(() => false)) ||
+    (await fs.access(path.join(wsDir, 'vite.config.mjs')).then(() => true).catch(() => false));
+
+  if (hasServerTs || hasServerJs || hasVite) {
+    await ensureWorkspaceDependencies(wsDir).catch(() => null);
+  }
 
   const port = await allocateEphemeralPort();
   const rootBinDir = path.resolve(process.cwd(), 'node_modules', '.bin');
@@ -508,7 +787,7 @@ async function startWorkspaceServerInternal(
   if (!cmd) {
     if (hasServerTs) cmd = hasLocalTsx ? `"${tsxBin}" server.ts` : `npx tsx server.ts`;
     else if (hasServerJs) cmd = `node server.js`;
-    else if (hasVite) cmd = hasLocalVite ? `"${viteBin}" --port ${port} --host 127.0.0.1` : `npx vite --port ${port} --host 127.0.0.1`;
+    else if (hasVite) cmd = hasLocalVite ? `"${viteBin}" --port ${port} --host 127.0.0.1 --base /w/${safeId}/` : `npx vite --port ${port} --host 127.0.0.1 --base /w/${safeId}/`;
     else {
       // Static workspace: no background daemon needed, /w/:sessionId/ serves static files directly
       return {
@@ -526,6 +805,8 @@ async function startWorkspaceServerInternal(
     env: {
       ...process.env,
       PORT: String(port),
+      DISABLE_HMR: 'true',
+      ENABLE_HMR: 'false',
       NODE_PATH: [process.env.NODE_PATH, rootNodeModules].filter(Boolean).join(':'),
     },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -558,9 +839,9 @@ async function startWorkspaceServerInternal(
     runtime.status = code === 0 ? 'stopped' : 'error';
   });
 
-  // Poll 127.0.0.1:port up to 25s until listening
+  // Poll 127.0.0.1:port up to 35s until listening
   let listening = false;
-  const deadline = Date.now() + 25000;
+  const deadline = Date.now() + 35000;
   while (Date.now() < deadline) {
     if (runtime.status === 'error' || runtime.status === 'stopped') break;
     try {
@@ -661,7 +942,10 @@ export async function handleWorkspaceProxyRequest(req: Request, res: Response) {
     return res.redirect(302, `${rawPathOnly}/${querySuffix}`);
   }
 
-  const hasVite = await fs.access(path.join(wsDir, 'vite.config.ts')).then(() => true).catch(() => false);
+  const hasVite =
+    (await fs.access(path.join(wsDir, 'vite.config.ts')).then(() => true).catch(() => false)) ||
+    (await fs.access(path.join(wsDir, 'vite.config.js')).then(() => true).catch(() => false)) ||
+    (await fs.access(path.join(wsDir, 'vite.config.mjs')).then(() => true).catch(() => false));
   const hasServerTs = await fs.access(path.join(wsDir, 'server.ts')).then(() => true).catch(() => false);
   const hasServerJs = await fs.access(path.join(wsDir, 'server.js')).then(() => true).catch(() => false);
   const hasDistIndex = await fs.access(path.join(wsDir, 'dist', 'index.html')).then(() => true).catch(() => false);
@@ -678,10 +962,19 @@ export async function handleWorkspaceProxyRequest(req: Request, res: Response) {
   if (rt && rt.status === 'running') {
     try {
       const viteCfgRaw = hasVite
-        ? await fs.readFile(path.join(wsDir, 'vite.config.ts'), 'utf-8').catch(() => '')
+        ? await Promise.any([
+            fs.readFile(path.join(wsDir, 'vite.config.ts'), 'utf-8'),
+            fs.readFile(path.join(wsDir, 'vite.config.js'), 'utf-8'),
+            fs.readFile(path.join(wsDir, 'vite.config.mjs'), 'utf-8'),
+          ]).catch(() => '')
         : '';
-      const hasWorkspaceBase = viteCfgRaw.includes(`/w/${safeId}`);
-      const upstreamPath = hasVite ? (hasWorkspaceBase ? req.originalUrl : targetSubPath) : targetSubPath;
+      const hasWorkspaceBase = viteCfgRaw.includes(`/w/${safeId}`) || rt.command.includes(`/w/${safeId}`);
+      const isApiCall = targetSubPath.startsWith('/api');
+      const upstreamPath = isApiCall
+        ? targetSubPath
+        : hasVite
+          ? (hasWorkspaceBase ? req.originalUrl : targetSubPath)
+          : targetSubPath;
       const targetUrl = `http://127.0.0.1:${rt.port}${upstreamPath}`;
       const fwdHeaders: Record<string, string> = {};
       for (const [k, v] of Object.entries(req.headers)) {
@@ -715,13 +1008,23 @@ export async function handleWorkspaceProxyRequest(req: Request, res: Response) {
       });
       const buf = Buffer.from(await upstream.arrayBuffer());
       if (targetSubPath.startsWith('/@vite/client') || req.originalUrl.includes('/@vite/client')) {
-        const safeCode = buf
+        let safeCode = buf
           .toString('utf-8')
           .replace(/\bws\.send\(/g, 'ws?.send(')
           .replace(/await wsTransport\.connect\(handlers\);/g, 'return;');
+        if (!hasWorkspaceBase) {
+          safeCode = safeCode.replace(/(["'])\/(?=@vite\/|@react-refresh|@fs\/|src\/|node_modules\/)/g, `$1/w/${safeId}/`);
+        }
         res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
         res.setHeader('Cache-Control', 'no-cache');
         res.send(safeCode);
+        return;
+      }
+      if (!hasWorkspaceBase && (contentType.includes('javascript') || contentType.includes('ecmascript'))) {
+        const rewrittenJs = buf
+          .toString('utf-8')
+          .replace(/(["'])\/(?=@vite\/|@react-refresh|@fs\/|@id\/|src\/|node_modules\/)/g, `$1/w/${safeId}/`);
+        res.send(rewrittenJs);
         return;
       }
       if (contentType.includes('text/html')) {
@@ -735,6 +1038,13 @@ export async function handleWorkspaceProxyRequest(req: Request, res: Response) {
           if (!html.includes('<base ')) {
             html = html.replace(/<head([^>]*)>/i, `<head$1><base href="/w/${safeId}/">`);
           }
+        }
+        const apiProxyShim = `<script>(function(){if(window.__nexusApiPrefixShim)return;window.__nexusApiPrefixShim=true;var origFetch=window.fetch;if(typeof origFetch==='function'){window.fetch=function(input,init){try{if(typeof input==='string'&&input.startsWith('/api/')){input='/w/${safeId}'+input;}else if(input instanceof Request&&input.url){var u=new URL(input.url,window.location.origin);if(u.origin===window.location.origin&&u.pathname.startsWith('/api/')){input=new Request('/w/${safeId}'+u.pathname+u.search,input);}}}catch(e){}return origFetch.call(this,input,init);};}})();</script>`;
+        if (!html.includes('__nexusApiPrefixShim')) {
+          const idx = html.indexOf('</head>');
+          html = idx !== -1
+            ? html.slice(0, idx) + apiProxyShim + html.slice(idx)
+            : apiProxyShim + html;
         }
         if (!html.includes('__nexusElementPicker')) {
           const idx = html.indexOf('</head>');

@@ -322,9 +322,14 @@ export async function validatePreWriteGuardrails(
   };
 }
 
+export function isGitHubClonePrompt(promptText: string): boolean {
+  const lower = (promptText || '').toLowerCase();
+  return /(?:gh\s+repo\s+clone|git\s+clone|github\.com\/[a-z0-9_.-]+\/[a-z0-9_.-]+|(?:clone|import|ক্লোন|ইমপোর্ট).*(?:repo|repository|github|রিপো|প্রিভিউ)|(?:repo|repository|রিপো).*(?:clone|ক্লোন))/i.test(lower);
+}
+
 export function shouldUseModularArchitecture(promptText: string): boolean {
   const lower = (promptText || '').toLowerCase();
-  if (/(gh\s+repo\s+clone|server\/apiOrchestrator|src\/components\/GoogleAIStudioCoderView)/i.test(lower)) return false;
+  if (isGitHubClonePrompt(promptText) || /(server\/apiOrchestrator|src\/components\/GoogleAIStudioCoderView)/i.test(lower)) return false;
   return /(build|create|make|design|develop|website|web\s*app|landing\s*page|dashboard|saas|store|shop|ecommerce|e-commerce|portfolio|crm|erp|lms|portal|platform|site|game|arcade|fullstack|full-stack|react|vite|backend|api|multi-?file|components|pages|বানা|তৈরি|ওয়েবসাইট|ওয়েবসাইট|সাইট|ড্যাশবোর্ড|ই-কমার্স|পোর্টফোলিও|অ্যাপ|গেম|প্ল্যাটফর্ম|পোর্টাল)/i.test(lower);
 }
 
@@ -333,10 +338,19 @@ export function getVerifiedScaffoldBlueprint(promptText: string, sessionId?: str
   const lower = (promptText || '').toLowerCase();
   if (!lower.trim()) return null;
 
+  const safeId = (sessionId || 'app').replace(/[^a-zA-Z0-9_-]/g, '_');
+
+  if (isGitHubClonePrompt(promptText)) {
+    return `[GITHUB REPO CLONE & SANDBOX PREVIEW WORKFLOW]:
+- The user wants to clone a GitHub repository and run/view it in Live Preview. Do NOT rewrite the project from scratch!
+- Note: \`gh\` CLI is not installed in the container, so ALWAYS use \`github_clone(repo: "<owner/repo or URL>", sessionId: "${safeId}", autoStart: true)\` (or \`run_command\` with \`git clone\`, which also auto-translates \`gh repo clone\`).
+- \`github_clone\` automatically clones into \`workspaces/${safeId}/\`, removes incompatible lockfiles, links/installs npm dependencies, configures Vite/Express for \`/w/${safeId}/\`, and boots the live preview server.
+- After \`github_clone\`, inspect key files if needed, verify with \`verify_live_preview(targetUrl: "/w/${safeId}/")\`, and report the cloned files & live preview status.`;
+  }
+
   const isBuild = shouldUseModularArchitecture(promptText) || /(build|create|make|design|develop|app|website|dashboard|saas|store|ecommerce|e-commerce|portfolio|landing|auth|login|api|বানা|তৈরি|ওয়েবসাইট|ওয়েবসাইট|সাইট|ড্যাশবোর্ড|ই-কমার্স)/i.test(lower);
   if (!isBuild) return null;
 
-  const safeId = (sessionId || 'app').replace(/[^a-zA-Z0-9_-]/g, '_');
   const needsBackend = /(full-?stack|express|backend|database|api|postgres|sqlite|crud|auth|login|ফুল-স্ট্যাক)/i.test(lower);
   const modular = shouldUseModularArchitecture(promptText);
   const modularLayout = modular
@@ -375,6 +389,7 @@ export function getVerifiedScaffoldBlueprint(promptText: string, sessionId?: str
 
 // Deterministic Task Checklist for multi-step large website builds
 export function buildDeterministicTaskPlan(promptText: string): string | null {
+  if (isGitHubClonePrompt(promptText)) return null;
   const lower = (promptText || '').toLowerCase();
   const isComplexBuild =
     shouldUseModularArchitecture(promptText) ||

@@ -23,7 +23,7 @@ import {
   fuzzyReplaceContent,
 } from "./workspaceEngine.ts";
 import { rankAstContext } from "./astContextRanker.ts";
-import { initSessionWorkspace, startWorkspaceServer, stopWorkspaceServer, getWorkspaceStatus } from "./sandboxManager.ts";
+import { initSessionWorkspace, startWorkspaceServer, stopWorkspaceServer, getWorkspaceStatus, cloneGitHubRepoToWorkspace, normalizeGitHubRepoSpec } from "./sandboxManager.ts";
 import { getPersistenceStatus } from "./persistenceStore.ts";
 import { runVisualQaReview } from "./visualQa.ts";
 import { validatePreWriteGuardrails } from "./harnessEngine.ts";
@@ -948,6 +948,21 @@ const workspaceRunTool: FunctionDeclaration = {
   },
 };
 
+const githubCloneTool: FunctionDeclaration = {
+  name: "github_clone",
+  description: "Clone a GitHub repository (supports 'owner/repo', 'gh repo clone owner/repo', or 'https://github.com/owner/repo') directly into the isolated session workspace workspaces/<sessionId>/, normalize dependencies and Vite/Express /w/<sessionId>/ proxy routing, and boot it for Live Preview.",
+  parameters: {
+    type: Type.OBJECT,
+    properties: {
+      repo: { type: Type.STRING, description: "GitHub repository slug or URL (e.g. 'arifnanhssb-ai/Nexus-ai' or 'https://github.com/owner/repo')." },
+      sessionId: { type: Type.STRING, description: "Optional workspace session ID (defaults to active session)." },
+      branch: { type: Type.STRING, description: "Optional branch name to clone." },
+      autoStart: { type: Type.BOOLEAN, description: "Automatically install/link dependencies and start the sandbox preview server (default: true)." },
+    },
+    required: ["repo"],
+  },
+};
+
 const astContextRankerTool: FunctionDeclaration = {
   name: "ast_context_ranker",
   description: "Extract TypeScript/TSX AST function signatures, interfaces, props, routes, and call-graph ranked by relevance to your query—saves 60-70% tokens vs reading whole files.",
@@ -1020,6 +1035,7 @@ export const serverTools: FunctionDeclaration[] = [
   visualQaReviewTool,
   workspaceInitTool,
   workspaceRunTool,
+  githubCloneTool,
   persistenceStatusTool,
   searchWebTool,
   generateImageTool,
@@ -1658,6 +1674,7 @@ export async function executeServerTool(
       'visual_qa_review': `Running Visual QA Screenshot & Layout Audit (${args.targetUrl || '/projects/index.html'})...`,
       'workspace_init': `Initializing isolated sandbox workspace (${args.template || 'fullstack-express'})...`,
       'workspace_run': `Sandbox sub-server (${args.action || 'start'})...`,
+      'github_clone': `Cloning GitHub repo ${args.repo || ''} into sandbox preview...`,
       'ast_context_ranker': `Ranking TypeScript AST signatures & call-graph for "${args.query}"...`,
       'persistence_status': `Checking PostgreSQL / Turso / Supabase persistence status...`,
       'set_up_firebase': `Provisioning Firebase SDK, blueprint & firestore.rules...`,
@@ -1973,8 +1990,18 @@ export async function executeServerTool(
 
       case 'run_command':
       case 'bash': {
-        const cmd = String(args.CommandLine || args.command || '').trim();
+        let cmd = String(args.CommandLine || args.command || '').trim();
         if (!cmd) return { error: "CommandLine is required" };
+        // Auto-translate `gh repo clone owner/repo [dest]` because `gh` CLI is not installed (only `git` is available)
+        const ghMatch = cmd.match(/^\s*gh\s+repo\s+clone\s+(\S+)(?:\s+([^\s;|&]+))?(.*)$/i);
+        if (ghMatch) {
+          const parsedRepo = normalizeGitHubRepoSpec(ghMatch[1]);
+          if (parsedRepo) {
+            const destArg = ghMatch[2] ? ` "${ghMatch[2].replace(/^["']|["']$/g, '')}"` : '';
+            const restArgs = ghMatch[3] || '';
+            cmd = `git clone --depth 1 "${parsedRepo.cloneUrl}"${destArg}${restArgs}`;
+          }
+        }
         if (/(rm\s+-rf\s+\/\s*$|rm\s+-rf\s+\/\*|\.secrets\.json)/i.test(cmd)) {
           return { error: "Safety guard: destructive root or secret file shell command blocked." };
         }
@@ -3050,6 +3077,16 @@ export const ${componentName}: React.FC<${componentName}Props> = ({ className = 
         if (action === 'stop') return await stopWorkspaceServer(sid);
         if (action === 'status') return await getWorkspaceStatus(sid);
         return await startWorkspaceServer(sid, args.command);
+      }
+
+      case 'github_clone': {
+        const sid = args.sessionId || execCtx?.sessionId || 'default';
+        return await cloneGitHubRepoToWorkspace({
+          repo: args.repo || '',
+          sessionId: sid,
+          branch: args.branch,
+          autoStart: args.autoStart !== false,
+        });
       }
 
       case 'ast_context_ranker': {
