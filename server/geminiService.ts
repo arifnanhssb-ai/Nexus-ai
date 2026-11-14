@@ -23,7 +23,16 @@ import {
   fuzzyReplaceContent,
 } from "./workspaceEngine.ts";
 import { rankAstContext } from "./astContextRanker.ts";
-import { initSessionWorkspace, startWorkspaceServer, stopWorkspaceServer, getWorkspaceStatus, cloneGitHubRepoToWorkspace, normalizeGitHubRepoSpec } from "./sandboxManager.ts";
+import {
+  initSessionWorkspace,
+  startWorkspaceServer,
+  stopWorkspaceServer,
+  getWorkspaceStatus,
+  cloneGitHubRepoToWorkspace,
+  normalizeGitHubRepoSpec,
+  installPackagesInTarget,
+  installDependenciesForTarget,
+} from "./sandboxManager.ts";
 import { getPersistenceStatus } from "./persistenceStore.ts";
 import { runVisualQaReview } from "./visualQa.ts";
 import { validatePreWriteGuardrails } from "./harnessEngine.ts";
@@ -286,16 +295,18 @@ const manageTaskTool: FunctionDeclaration = {
 
 const installAppletPackageTool: FunctionDeclaration = {
   name: "install_applet_package",
-  description: "Install npm packages to the project. Adds packages to package.json and installs them. Call BEFORE importing new packages.",
+  description: "Install npm packages to the active session workspace (workspaces/<sessionId>/) or project root. Adds packages to package.json and installs them cleanly without peer-conflict failures. Call BEFORE importing new packages.",
   parameters: {
     type: Type.OBJECT,
     properties: {
       PackageNames: {
         type: Type.ARRAY,
         items: { type: Type.STRING },
-        description: "The names of npm packages to install (e.g. ['lucide-react', 'date-fns']).",
+        description: "The names of npm packages to install (e.g. ['zustand', 'lucide-react', 'date-fns']).",
       },
       IsDevDependency: { type: Type.BOOLEAN, description: "Whether to install as dev dependency (-D)." },
+      sessionId: { type: Type.STRING, description: "Optional session workspace ID (auto-detected from active session if omitted)." },
+      TargetDir: { type: Type.STRING, description: "Optional target directory (e.g. 'workspaces/session_123' or '.' for root)." },
     },
     required: ["PackageNames"],
   },
@@ -303,8 +314,14 @@ const installAppletPackageTool: FunctionDeclaration = {
 
 const installAppletDependenciesTool: FunctionDeclaration = {
   name: "install_applet_dependencies",
-  description: "Install all dependencies from package.json via npm install. Use after cloning a repository or modifying package.json.",
-  parameters: { type: Type.OBJECT, properties: {} },
+  description: "Install all dependencies from package.json via npm install for the active session workspace or root project. Use after cloning a repository or modifying package.json.",
+  parameters: {
+    type: Type.OBJECT,
+    properties: {
+      sessionId: { type: Type.STRING, description: "Optional session workspace ID." },
+      TargetDir: { type: Type.STRING, description: "Optional target directory (e.g. 'workspaces/session_123' or '.' for root)." },
+    },
+  },
 };
 
 const grepSearchTool: FunctionDeclaration = {
@@ -1995,7 +2012,74 @@ export async function executeServerTool(
       case 'bash': {
         let cmd = String(args.CommandLine || args.command || '').trim();
         if (!cmd) return { error: "CommandLine is required" };
-        // Auto-translate `gh repo clone owner/repo [dest]` because `gh` CLI is not installed (only `git` is available)
+        if (/(rm\s+-rf\s+\/\s*$|rm\s+-rf\s+\/\*|\.secrets\.json)/i.test(cmd)) {
+          return { error: "Safety guard: destructive root or secret file shell command blocked." };
+        }
+        const safeCwd = args.Cwd ? resolveSafePath(args.Cwd, false).abs : process.cwd();
+        const cwd = safeCwd.startsWith(process.cwd()) ? safeCwd : process.cwd();
+
+        // Intercept standalone `gh repo clone <repo>` or `git clone <github-url>` so cloned repos go into isolated workspace sandbox with deps & /w/<sessionId>/ preview
+        const hasChainedCmd = /[;&|\n]/.test(cmd);
+        const cloneMatch = !hasChainedCmd
+          ? cmd.match(/^\s*(?:gh\s+repo\s+clone|git\s+clone(?:\s+--depth\s+\d+)?(?:\s+(?:-b|--branch)\s+(\S+))?)\s+(\S+)(?:\s+([^\s;|&]+))?(?:\s+--depth\s+\d+)?(?:\s+(?:-b|--branch)\s+(\S+))?\s*$/i)
+          : null;
+        if (cloneMatch) {
+          const parsedRepo = normalizeGitHubRepoSpec(cloneMatch[2]);
+          const destArg = (cloneMatch[3] || '').replace(/^["']|["']$/g, '');
+          const branchArg = cloneMatch[1] || cloneMatch[4] || undefined;
+          const isTmpDest = /^\/tmp\//i.test(destArg);
+          if (parsedRepo && !isTmpDest) {
+            const wsDestMatch = destArg.match(/^(?:\.\/)?workspaces\/([^/]+)\/?$/i);
+            const targetSid = wsDestMatch?.[1] || execCtx?.sessionId || 'default';
+            const cloneRes = await cloneGitHubRepoToWorkspace({
+              repo: parsedRepo.slug,
+              sessionId: targetSid,
+              branch: branchArg,
+              autoStart: true,
+            });
+            return {
+              ...cloneRes,
+              clonedWorkspace: true,
+              previewUrl: cloneRes.success && cloneRes.serverStatus?.success !== false ? cloneRes.proxyUrl : undefined,
+              stdout: cloneRes.success ? `Cloned ${parsedRepo.slug} into ${cloneRes.workspacePath} and booted preview at ${cloneRes.proxyUrl}` : '',
+              stderr: cloneRes.error || '',
+              exitCode: cloneRes.success ? 0 : 1,
+            };
+          }
+        }
+
+        // Intercept standalone `npm install <pkgs>` (e.g. `npm install zustand --legacy-peer-deps`) so it installs cleanly without root peer-conflict hangs
+        const npmInstMatch = !hasChainedCmd
+          ? cmd.match(/^\s*npm\s+(?:install|i|add)\s+(.+)$/i)
+          : null;
+        if (npmInstMatch && !/\s(?:-g|--global)\b/.test(cmd)) {
+          const tokens = npmInstMatch[1].trim().split(/\s+/).filter(Boolean);
+          const isDev = tokens.some((t) => t === '-D' || t === '--save-dev');
+          const pkgTokens = tokens.filter((t) => !t.startsWith('-') && /^[a-zA-Z0-9@._/-]+(?:@[a-zA-Z0-9._^~>=<|-]+)?$/.test(t));
+          const relCwd = path.relative(process.cwd(), cwd);
+          const explicitTarget = relCwd && relCwd !== '.' ? relCwd : undefined;
+          if (pkgTokens.length > 0) {
+            const instRes = await installPackagesInTarget({
+              packages: pkgTokens,
+              isDev,
+              sessionId: execCtx?.sessionId,
+              targetDir: explicitTarget,
+            });
+            if (instRes.success) {
+              return { ...instRes, stdout: instRes.message || instRes.stdout || '', stderr: '', exitCode: 0 };
+            }
+          } else if (pkgTokens.length === 0) {
+            const depRes = await installDependenciesForTarget({
+              sessionId: execCtx?.sessionId,
+              targetDir: explicitTarget,
+            });
+            if (depRes.success) {
+              return { ...depRes, stdout: depRes.message || depRes.stdout || '', stderr: '', exitCode: 0 };
+            }
+          }
+        }
+
+        // Auto-translate `gh repo clone` inside compound commands because `gh` CLI is not installed
         const ghMatch = cmd.match(/^\s*gh\s+repo\s+clone\s+(\S+)(?:\s+([^\s;|&]+))?(.*)$/i);
         if (ghMatch) {
           const parsedRepo = normalizeGitHubRepoSpec(ghMatch[1]);
@@ -2005,14 +2089,14 @@ export async function executeServerTool(
             cmd = `git clone --depth 1 "${parsedRepo.cloneUrl}"${destArg}${restArgs}`;
           }
         }
-        if (/(rm\s+-rf\s+\/\s*$|rm\s+-rf\s+\/\*|\.secrets\.json)/i.test(cmd)) {
-          return { error: "Safety guard: destructive root or secret file shell command blocked." };
+        // Speed up any remaining npm install command with --no-audit --no-fund --legacy-peer-deps
+        if (/^\s*npm\s+(?:install|i|ci)\b/i.test(cmd) && !/--no-audit/.test(cmd)) {
+          cmd = cmd.replace(/\bnpm\s+(install|i|ci)\b/i, 'npm $1 --no-audit --no-fund --legacy-peer-deps');
         }
-        const safeCwd = args.Cwd ? resolveSafePath(args.Cwd, false).abs : process.cwd();
-        const cwd = safeCwd.startsWith(process.cwd()) ? safeCwd : process.cwd();
+
         const isHeavyCmd = /\b(npm\s+install|npm\s+ci|npx|vite\s+build|git\s+clone|tsc)\b/i.test(cmd);
-        const defaultWait = isHeavyCmd ? 45000 : 15000;
-        const waitMs = Math.min(Math.max(args.WaitMsBeforeAsync || defaultWait, 500), 90000);
+        const defaultWait = isHeavyCmd ? 90000 : 15000;
+        const waitMs = Math.min(Math.max(args.WaitMsBeforeAsync || defaultWait, 500), 120000);
 
         if (args.IsDaemon) {
           const taskId = `task_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
@@ -2047,6 +2131,12 @@ export async function executeServerTool(
           const { stdout, stderr } = await execPromise(cmd, {
             cwd,
             timeout: waitMs,
+            env: {
+              ...process.env,
+              GIT_TERMINAL_PROMPT: '0',
+              npm_config_audit: 'false',
+              npm_config_fund: 'false',
+            },
           });
           return { stdout: stdout.trim(), stderr: stderr.trim(), exitCode: 0 };
         } catch (execErr: any) {
@@ -2069,52 +2159,19 @@ export async function executeServerTool(
         const packages = (Array.isArray(rawPackages) ? rawPackages : [rawPackages])
           .map((p: any) => String(p || '').trim())
           .filter((p: string) => /^[a-zA-Z0-9@._/-]+(?:@[a-zA-Z0-9._^~>=<|-]+)?$/.test(p));
-        if (packages.length === 0) return { error: "Valid PackageNames array is required" };
-        const flag = (args.IsDevDependency || args.isDev) ? '-D' : '';
-        const pkgArgs = packages.join(' ');
-        const installCmd = `npm install ${flag} ${pkgArgs}`.replace(/\s+/g, ' ').trim();
-
-        try {
-          const { stdout } = await execPromise(installCmd, { cwd: process.cwd(), timeout: 60000 });
-          return {
-            success: true,
-            packages,
-            message: `Installed [${packages.join(', ')}] successfully`,
-            stdout: stdout.trim().slice(-1500),
-          };
-        } catch (instErr: any) {
-          // React 19 / Vite 8 peer-dependency conflicts (ERESOLVE) are common — retry automatically with --legacy-peer-deps
-          const legacyCmd = `npm install --legacy-peer-deps ${flag} ${pkgArgs}`.replace(/\s+/g, ' ').trim();
-          try {
-            const { stdout } = await execPromise(legacyCmd, { cwd: process.cwd(), timeout: 60000 });
-            return {
-              success: true,
-              packages,
-              legacyPeerDeps: true,
-              message: `Installed [${packages.join(', ')}] successfully (with --legacy-peer-deps for React 19 compatibility)`,
-              stdout: stdout.trim().slice(-1500),
-            };
-          } catch (legacyErr: any) {
-            return {
-              error: `npm install failed: ${legacyErr.message || instErr.message}`,
-              stderr: (legacyErr.stderr || instErr.stderr || '').slice(-1500),
-            };
-          }
-        }
+        return await installPackagesInTarget({
+          packages,
+          isDev: Boolean(args.IsDevDependency || args.isDev),
+          sessionId: args.sessionId || execCtx?.sessionId,
+          targetDir: args.TargetDir || args.targetDir,
+        });
       }
 
       case 'install_applet_dependencies': {
-        try {
-          const { stdout } = await execPromise('npm install', { cwd: process.cwd(), timeout: 60000 });
-          return { success: true, message: 'Installed all package.json dependencies via npm install.', stdout: stdout.trim() };
-        } catch (instErr: any) {
-          try {
-            const { stdout } = await execPromise('npm install --legacy-peer-deps', { cwd: process.cwd(), timeout: 60000 });
-            return { success: true, message: 'Installed dependencies with --legacy-peer-deps.', stdout: stdout.trim() };
-          } catch (legacyErr: any) {
-            return { error: `npm install failed: ${legacyErr.message}`, stderr: legacyErr.stderr };
-          }
-        }
+        return await installDependenciesForTarget({
+          sessionId: args.sessionId || execCtx?.sessionId,
+          targetDir: args.TargetDir || args.targetDir,
+        });
       }
 
       case 'compile_applet':

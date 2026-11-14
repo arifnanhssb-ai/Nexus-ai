@@ -1151,7 +1151,7 @@ function selectRelevantTools(
   ]);
 
   const lower = (promptText || '').toLowerCase();
-  if (/(install|package|npm|react|express|server|backend|api|build|typescript|vite|clone|repo|github|gh\s+repo|sandbox|workspace|fullstack|ফুল-স্ট্যাক|ক্লোন|রিপো|গিটহাব|প্রিভিউ)/i.test(lower)) {
+  if (/(install|package|npm|react|express|server|backend|api|build|typescript|vite|clone|repo|github|gh\s+repo|sandbox|workspace|fullstack|ফুল-স্ট্যাক|ক্লোন|রিপো|গিটহাব|প্রিভিউ|ইমপোর্ট)/i.test(lower) || /github\.com\//i.test(lower)) {
     baseTools.add('analyze_project');
     baseTools.add('find_by_name');
     baseTools.add('install_applet_package');
@@ -1649,7 +1649,11 @@ async function ensureWorkspacePreviewEmitted(
     const m = clean.match(/^workspaces\/([^/]+)\//);
     if (m?.[1]) wsIds.add(sanitizeSessionId(m[1]));
   }
-  if (wsIds.size === 0 && sharedProgress.executedTools.includes('workspace_init') && sessionId) {
+  if (
+    wsIds.size === 0 &&
+    (sharedProgress.executedTools.includes('workspace_init') || sharedProgress.executedTools.includes('github_clone')) &&
+    sessionId
+  ) {
     wsIds.add(sanitizeSessionId(sessionId));
   }
   const firstWs = Array.from(wsIds)[0];
@@ -1839,43 +1843,46 @@ async function runMandatorySelfHealingGate(
       );
     }
 
+    const isClonedRepoTask =
+      isGitHubClonePrompt(harnessCtx?.originalPrompt || '') ||
+      Boolean(harnessCtx?.sharedProgress?.executedTools?.includes('github_clone'));
+
     for (const wsId of workspaceIds) {
       const safeWsId = sanitizeSessionId(wsId);
       const wsDir = path.resolve(process.cwd(), 'workspaces', safeWsId);
       let wsTscPassed = true;
 
-      try {
-        await fs.access(path.join(wsDir, 'tsconfig.json'));
+      // Cloned third-party GitHub repos may have upstream TypeScript strictness or PWA build quirks — boot & verify runtime directly instead of blocking on tsc/vite build
+      if (!isClonedRepoTask) {
         try {
-          await execPromise('npx tsc --noEmit', { cwd: wsDir, timeout: 25000 });
-        } catch (wsTscErr: any) {
-          wsTscPassed = false;
-          failures.push(
-            `[Sandbox /w/${safeWsId} TypeScript Errors]:\n${(wsTscErr.stdout || wsTscErr.stderr || wsTscErr.message || '').slice(0, 1800)}`
-          );
-        }
-      } catch {
-        // No tsconfig.json in sandbox
-      }
-
-      if (wsTscPassed) {
-        try {
-          await fs.access(path.join(wsDir, 'vite.config.ts'));
+          await fs.access(path.join(wsDir, 'tsconfig.json'));
           try {
-            await execPromise('npx vite build', { cwd: wsDir, timeout: 45000 });
-          } catch (wsViteErr: any) {
+            await execPromise('npx tsc --noEmit', { cwd: wsDir, timeout: 25000 });
+          } catch (wsTscErr: any) {
+            wsTscPassed = false;
             failures.push(
-              `[Sandbox /w/${safeWsId} Vite Build Errors]:\n${(wsViteErr.stdout || wsViteErr.stderr || wsViteErr.message || '').slice(0, 1800)}`
+              `[Sandbox /w/${safeWsId} TypeScript Errors]:\n${(wsTscErr.stdout || wsTscErr.stderr || wsTscErr.message || '').slice(0, 1800)}`
             );
           }
         } catch {
-          // No vite.config.ts in sandbox
+          // No tsconfig.json in sandbox
+        }
+
+        if (wsTscPassed) {
+          try {
+            await fs.access(path.join(wsDir, 'vite.config.ts'));
+            try {
+              await execPromise('npx vite build', { cwd: wsDir, timeout: 45000 });
+            } catch (wsViteErr: any) {
+              failures.push(
+                `[Sandbox /w/${safeWsId} Vite Build Errors]:\n${(wsViteErr.stdout || wsViteErr.stderr || wsViteErr.message || '').slice(0, 1800)}`
+              );
+            }
+          } catch {
+            // No vite.config.ts in sandbox
+          }
         }
       }
-
-      const isClonedRepoTask =
-        isGitHubClonePrompt(harnessCtx?.originalPrompt || '') ||
-        Boolean(harnessCtx?.sharedProgress?.executedTools?.includes('github_clone'));
 
       // Large Website Completeness & Scale Audit: ensure new websites are comprehensive 10-30+ file builds (skip for cloned GitHub repos)
       if (isModularWebsiteTask && !isClonedRepoTask) {
@@ -1936,12 +1943,16 @@ async function runMandatorySelfHealingGate(
         process.env.GEMINI_API_KEY;
 
       const wsPreviewUrl = `/w/${safeWsId}/`;
-      const domRes = await verifyLivePreviewWithDom(wsPreviewUrl, true, sessionId);
-      if (!domRes.ok) {
+      const domRes = await verifyLivePreviewWithDom(wsPreviewUrl, !isClonedRepoTask, sessionId);
+      const fatalClonedErr =
+        isClonedRepoTask
+          ? Boolean(domRes.error || !domRes.status || domRes.status >= 500)
+          : !domRes.ok;
+      if (fatalClonedErr) {
         failures.push(
-          `[Sandbox ${wsPreviewUrl} Verification Errors]: syntax=${JSON.stringify(domRes.syntaxErrors)}, runtime=${JSON.stringify(domRes.runtimeErrors)}, clickErrors=${JSON.stringify(domRes.interactionAudit?.clickErrors || [])}, brokenAssets=${JSON.stringify(domRes.brokenAssets)}, emptyRoot=${domRes.domMetrics?.emptyRootDetected}`
+          `[Sandbox ${wsPreviewUrl} Verification Errors]: status=${domRes.status || 'unreachable'}, error=${domRes.error || 'none'}, syntax=${JSON.stringify(domRes.syntaxErrors)}, runtime=${JSON.stringify(domRes.runtimeErrors)}, clickErrors=${JSON.stringify(domRes.interactionAudit?.clickErrors || [])}, brokenAssets=${JSON.stringify(domRes.brokenAssets)}, emptyRoot=${domRes.domMetrics?.emptyRootDetected}`
         );
-      } else if (process.env.BROWSERLESS_TOKEN || process.env.BROWSERLESS_URL) {
+      } else if (!isClonedRepoTask && (process.env.BROWSERLESS_TOKEN || process.env.BROWSERLESS_URL)) {
         const vqaStepId = emitActionStep(
           sendEvent,
           'qc',
@@ -2583,8 +2594,9 @@ The server will execute it immediately and send back the result so you can conti
             if (tf) sharedProgress?.mutatedFiles.add(String(tf));
           }
           const toolResult = await executeToolWithLiveEvents(tc.function.name, parsedArgs, sendEvent, execCtx);
-          if (tc.function.name === 'github_clone' && toolResult?.success && toolResult?.workspacePath) {
+          if ((tc.function.name === 'github_clone' || toolResult?.clonedWorkspace) && toolResult?.success && toolResult?.workspacePath) {
             didMutateFiles = true;
+            if (tc.function.name !== 'github_clone') sharedProgress?.executedTools.push('github_clone');
             sharedProgress?.mutatedFiles.add(`${toolResult.workspacePath}/.nexus_cloned`);
           }
           return {
@@ -2614,8 +2626,9 @@ The server will execute it immediately and send back the result so you can conti
           if (tf) sharedProgress?.mutatedFiles.add(String(tf));
         }
         const toolResult = await executeToolWithLiveEvents(tc.name, tc.args, sendEvent, execCtx);
-        if (tc.name === 'github_clone' && toolResult?.success && toolResult?.workspacePath) {
+        if ((tc.name === 'github_clone' || toolResult?.clonedWorkspace) && toolResult?.success && toolResult?.workspacePath) {
           didMutateFiles = true;
+          if (tc.name !== 'github_clone') sharedProgress?.executedTools.push('github_clone');
           sharedProgress?.mutatedFiles.add(`${toolResult.workspacePath}/.nexus_cloned`);
         }
         resultSummaries.push({ tool: tc.name, result: toolResult });
@@ -3128,8 +3141,9 @@ async function runGeminiAgentLoop(
             if (tf) sharedProgress?.mutatedFiles.add(String(tf));
           }
           const toolResult = await executeToolWithLiveEvents(call.name, call.args, sendEvent, execCtx);
-          if (call.name === 'github_clone' && toolResult?.success && toolResult?.workspacePath) {
+          if ((call.name === 'github_clone' || toolResult?.clonedWorkspace) && toolResult?.success && toolResult?.workspacePath) {
             didMutateFiles = true;
+            if (call.name !== 'github_clone') sharedProgress?.executedTools.push('github_clone');
             sharedProgress?.mutatedFiles.add(`${toolResult.workspacePath}/.nexus_cloned`);
           }
           return {
@@ -3159,8 +3173,9 @@ async function runGeminiAgentLoop(
           if (tf) sharedProgress?.mutatedFiles.add(String(tf));
         }
         const toolResult = await executeToolWithLiveEvents(tc.name, tc.args, sendEvent, execCtx);
-        if (tc.name === 'github_clone' && toolResult?.success && toolResult?.workspacePath) {
+        if ((tc.name === 'github_clone' || toolResult?.clonedWorkspace) && toolResult?.success && toolResult?.workspacePath) {
           didMutateFiles = true;
+          if (tc.name !== 'github_clone') sharedProgress?.executedTools.push('github_clone');
           sharedProgress?.mutatedFiles.add(`${toolResult.workspacePath}/.nexus_cloned`);
         }
         results.push({ tool: tc.name, result: toolResult });

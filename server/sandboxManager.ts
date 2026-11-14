@@ -439,25 +439,33 @@ export function normalizeGitHubRepoSpec(rawInput: string): {
   repo: string;
   cloneUrl: string;
   slug: string;
+  branchFromUrl?: string;
 } | null {
   let s = (rawInput || '').trim();
   s = s.replace(/^(?:gh\s+repo\s+clone|git\s+clone)\s+/i, '').trim();
   s = s.replace(/^["']|["']$/g, '').split(/\s+/)[0] || '';
-  s = s.replace(/\.git$/i, '').replace(/\/+$/, '');
+  s = s.replace(/\/+$/, '');
 
-  const sshMatch = s.match(/^git@github\.com:([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)$/i);
+  const sshMatch = s.match(/^git@github\.com:([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?$/i);
   if (sshMatch) {
     const [, owner, repo] = sshMatch;
     return { owner, repo, slug: `${owner}/${repo}`, cloneUrl: `https://github.com/${owner}/${repo}.git` };
   }
 
-  const urlMatch = s.match(/^https?:\/\/(?:www\.)?github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)(?:\/.*)?$/i);
+  const urlMatch = s.match(/^https?:\/\/(?:www\.)?github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?(?:\/tree\/([^/?#]+)|\/.*)?$/i);
   if (urlMatch) {
-    const [, owner, repo] = urlMatch;
-    return { owner, repo, slug: `${owner}/${repo}`, cloneUrl: `https://github.com/${owner}/${repo}.git` };
+    const [, owner, repo, branchFromUrl] = urlMatch;
+    return {
+      owner,
+      repo,
+      slug: `${owner}/${repo}`,
+      cloneUrl: `https://github.com/${owner}/${repo}.git`,
+      ...(branchFromUrl ? { branchFromUrl } : {}),
+    };
   }
 
-  const slugMatch = s.match(/^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)$/);
+  const cleanSlug = s.replace(/\.git$/i, '');
+  const slugMatch = cleanSlug.match(/^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)$/);
   if (slugMatch) {
     const [, owner, repo] = slugMatch;
     return { owner, repo, slug: `${owner}/${repo}`, cloneUrl: `https://github.com/${owner}/${repo}.git` };
@@ -466,7 +474,315 @@ export function normalizeGitHubRepoSpec(rawInput: string): {
   return null;
 }
 
-async function ensureWorkspaceDependencies(wsDir: string): Promise<{
+async function hasRootPeerConflicts(): Promise<boolean> {
+  try {
+    const raw = await fs.readFile(path.resolve(process.cwd(), 'package.json'), 'utf-8');
+    const pkg = JSON.parse(raw);
+    const tsVer = String(pkg.devDependencies?.typescript || pkg.dependencies?.typescript || '');
+    const hasTs7 = /(?:^|[^\d])(?:6\.[1-9]|[7-9]\.|1\d\.)/.test(tsVer);
+    const hasTsEslint = Boolean(pkg.dependencies?.['@typescript-eslint/typescript-estree'] || pkg.devDependencies?.['@typescript-eslint/typescript-estree']);
+    return hasTs7 && hasTsEslint;
+  } catch {
+    return false;
+  }
+}
+
+async function runNpmInstallFast(
+  cwd: string,
+  pkgArgs: string = '',
+  options: { timeoutMs?: number; forceLegacyPeerDeps?: boolean } = {}
+): Promise<{ stdout: string; legacyPeerDeps: boolean; ignoredScripts?: boolean }> {
+  const timeout = options.timeoutMs ?? 120000;
+  const cleanArgs = pkgArgs.trim();
+  const baseFlags = '--no-audit --no-fund --prefer-offline';
+  const preferLegacy = Boolean(options.forceLegacyPeerDeps);
+
+  const attempt = async (extraFlags: string) => {
+    const cmd = `npm install ${baseFlags} ${extraFlags} ${cleanArgs}`.replace(/\s+/g, ' ').trim();
+    return execPromise(cmd, {
+      cwd,
+      timeout,
+      env: {
+        ...process.env,
+        npm_config_audit: 'false',
+        npm_config_fund: 'false',
+        npm_config_update_notifier: 'false',
+      },
+    });
+  };
+
+  if (preferLegacy) {
+    try {
+      const { stdout } = await attempt('--legacy-peer-deps');
+      return { stdout, legacyPeerDeps: true };
+    } catch (legErr: any) {
+      try {
+        const { stdout } = await attempt('--legacy-peer-deps --ignore-scripts');
+        return { stdout, legacyPeerDeps: true, ignoredScripts: true };
+      } catch (ignErr: any) {
+        throw new Error((ignErr?.stderr || ignErr?.message || legErr?.stderr || legErr?.message || 'npm install failed').trim());
+      }
+    }
+  }
+
+  try {
+    const { stdout } = await attempt('');
+    return { stdout, legacyPeerDeps: false };
+  } catch (firstErr: any) {
+    try {
+      const { stdout } = await attempt('--legacy-peer-deps');
+      return { stdout, legacyPeerDeps: true };
+    } catch (legErr: any) {
+      try {
+        const { stdout } = await attempt('--legacy-peer-deps --ignore-scripts');
+        return { stdout, legacyPeerDeps: true, ignoredScripts: true };
+      } catch (ignErr: any) {
+        throw new Error((ignErr?.stderr || ignErr?.message || legErr?.stderr || legErr?.message || firstErr?.message || 'npm install failed').trim());
+      }
+    }
+  }
+}
+
+async function linkEntriesIntoNodeModules(srcNmDir: string, destNmDir: string, overwriteExisting: boolean): Promise<void> {
+  const entries = await fs.readdir(srcNmDir, { withFileTypes: true }).catch(() => []);
+  for (const ent of entries) {
+    if (ent.name.startsWith('.') && ent.name !== '.bin') continue;
+    const srcPath = path.join(srcNmDir, ent.name);
+    const destPath = path.join(destNmDir, ent.name);
+
+    if (ent.name === '.bin' || ent.name.startsWith('@')) {
+      const destStat = await fs.lstat(destPath).catch(() => null);
+      if (destStat?.isSymbolicLink()) {
+        await fs.unlink(destPath).catch(() => {});
+      }
+      await fs.mkdir(destPath, { recursive: true });
+      const subEntries = await fs.readdir(srcPath, { withFileTypes: true }).catch(() => []);
+      for (const sub of subEntries) {
+        const subSrc = path.join(srcPath, sub.name);
+        const subDest = path.join(destPath, sub.name);
+        const exists = await fs.lstat(subDest).then(() => true).catch(() => false);
+        if (exists) {
+          if (!overwriteExisting) continue;
+          await fs.rm(subDest, { recursive: true, force: true }).catch(() => {});
+        }
+        await fs.symlink(subSrc, subDest, 'dir').catch(() => {});
+      }
+      continue;
+    }
+
+    const exists = await fs.lstat(destPath).then(() => true).catch(() => false);
+    if (exists) {
+      if (!overwriteExisting) continue;
+      await fs.rm(destPath, { recursive: true, force: true }).catch(() => {});
+    }
+    await fs.symlink(srcPath, destPath, 'dir').catch(() => {});
+  }
+}
+
+export async function syncMergedWorkspaceNodeModules(wsDir: string): Promise<void> {
+  const wsNodeModules = path.join(wsDir, 'node_modules');
+  const rootNodeModules = path.resolve(process.cwd(), 'node_modules');
+  const extraNodeModules = path.join(wsDir, '.nexus_deps', 'node_modules');
+
+  const nmStat = await fs.lstat(wsNodeModules).catch(() => null);
+  if (nmStat?.isSymbolicLink()) {
+    await fs.unlink(wsNodeModules).catch(() => {});
+  }
+  await fs.mkdir(wsNodeModules, { recursive: true });
+
+  // Extra workspace-local packages override root packages when both exist
+  const hasExtra = await fs.access(extraNodeModules).then(() => true).catch(() => false);
+  if (hasExtra) {
+    await linkEntriesIntoNodeModules(extraNodeModules, wsNodeModules, true);
+  }
+  await linkEntriesIntoNodeModules(rootNodeModules, wsNodeModules, false);
+}
+
+function parsePackageSpecifier(raw: string): { name: string; specifier: string } {
+  const s = raw.trim();
+  if (s.startsWith('@')) {
+    const idx = s.indexOf('@', 1);
+    return idx > 0 ? { name: s.slice(0, idx), specifier: s.slice(idx + 1) } : { name: s, specifier: '' };
+  }
+  const idx = s.indexOf('@');
+  return idx > 0 ? { name: s.slice(0, idx), specifier: s.slice(idx + 1) } : { name: s, specifier: '' };
+}
+
+export async function installPackagesInTarget(options: {
+  packages: string[];
+  isDev?: boolean;
+  sessionId?: string;
+  targetDir?: string;
+}): Promise<{
+  success?: boolean;
+  error?: string;
+  stderr?: string;
+  packages?: string[];
+  target?: string;
+  legacyPeerDeps?: boolean;
+  message?: string;
+  stdout?: string;
+}> {
+  const { packages, isDev = false, sessionId, targetDir } = options;
+  if (!packages || packages.length === 0) {
+    return { error: 'Valid PackageNames array is required' };
+  }
+
+  // Decide whether to install into active session workspace or root project
+  let resolvedTarget = process.cwd();
+  let isWorkspaceTarget = false;
+  const cleanDir = (targetDir || '').trim().replace(/^[/\\]+/, '');
+  if (cleanDir && cleanDir !== '.' && cleanDir !== 'root') {
+    const abs = path.resolve(process.cwd(), cleanDir);
+    if (abs.startsWith(process.cwd())) {
+      resolvedTarget = abs;
+      isWorkspaceTarget = abs.startsWith(WORKSPACES_ROOT + path.sep) || abs === WORKSPACES_ROOT;
+    }
+  } else if (!cleanDir && sessionId) {
+    const safeId = sanitizeSessionId(sessionId);
+    const candidateWs = getWorkspaceDir(safeId);
+    const hasWsPkg = await fs.access(path.join(candidateWs, 'package.json')).then(() => true).catch(() => false);
+    if (hasWsPkg) {
+      resolvedTarget = candidateWs;
+      isWorkspaceTarget = true;
+    }
+  }
+
+  const flag = isDev ? '-D' : '';
+  const pkgArgs = packages.join(' ');
+
+  if (isWorkspaceTarget) {
+    const extraDir = path.join(resolvedTarget, '.nexus_deps');
+    await fs.mkdir(extraDir, { recursive: true });
+    const extraPkgPath = path.join(extraDir, 'package.json');
+    const hasExtraPkg = await fs.access(extraPkgPath).then(() => true).catch(() => false);
+    if (!hasExtraPkg) {
+      await fs.writeFile(
+        extraPkgPath,
+        JSON.stringify({ name: 'nexus-ws-extra-deps', private: true, dependencies: {} }, null, 2),
+        'utf-8'
+      );
+    }
+
+    try {
+      const res = await runNpmInstallFast(extraDir, `${flag} ${pkgArgs}`, {
+        timeoutMs: 120000,
+        forceLegacyPeerDeps: true,
+      });
+
+      await syncMergedWorkspaceNodeModules(resolvedTarget);
+
+      // Record installed packages + exact versions in workspace package.json so pre-write guardrails & tsc see them
+      const wsPkgPath = path.join(resolvedTarget, 'package.json');
+      try {
+        const wsPkg = JSON.parse(await fs.readFile(wsPkgPath, 'utf-8'));
+        const extraPkg = JSON.parse(await fs.readFile(extraPkgPath, 'utf-8'));
+        const installedAll = { ...(extraPkg.dependencies || {}), ...(extraPkg.devDependencies || {}) };
+        const sectionKey = isDev ? 'devDependencies' : 'dependencies';
+        wsPkg[sectionKey] = wsPkg[sectionKey] || {};
+        for (const rawPkg of packages) {
+          const { name, specifier } = parsePackageSpecifier(rawPkg);
+          wsPkg[sectionKey][name] = installedAll[name] || specifier || '*';
+        }
+        await fs.writeFile(wsPkgPath, JSON.stringify(wsPkg, null, 2), 'utf-8');
+      } catch {}
+
+      const relTarget = path.relative(process.cwd(), resolvedTarget) || '.';
+      return {
+        success: true,
+        packages,
+        target: relTarget,
+        legacyPeerDeps: res.legacyPeerDeps,
+        message: `Installed [${packages.join(', ')}] in ${relTarget} successfully`,
+        stdout: res.stdout.trim().slice(-1500),
+      };
+    } catch (err: any) {
+      return {
+        error: `npm install failed in ${path.relative(process.cwd(), resolvedTarget)}: ${err?.message || 'Unknown error'}`,
+        stderr: String(err?.message || '').slice(-1500),
+      };
+    }
+  }
+
+  // Root /app/applet install (always skip audit/fund and bypass known root peer conflict)
+  const forceLegacy = await hasRootPeerConflicts();
+  try {
+    const res = await runNpmInstallFast(resolvedTarget, `${flag} ${pkgArgs}`, {
+      timeoutMs: 120000,
+      forceLegacyPeerDeps: forceLegacy,
+    });
+    return {
+      success: true,
+      packages,
+      target: '.',
+      legacyPeerDeps: res.legacyPeerDeps,
+      message: `Installed [${packages.join(', ')}] successfully${res.legacyPeerDeps ? ' (--legacy-peer-deps)' : ''}`,
+      stdout: res.stdout.trim().slice(-1500),
+    };
+  } catch (err: any) {
+    return {
+      error: `npm install failed: ${err?.message || 'Unknown error'}`,
+      stderr: String(err?.message || '').slice(-1500),
+    };
+  }
+}
+
+export async function installDependenciesForTarget(options: {
+  sessionId?: string;
+  targetDir?: string;
+}): Promise<{
+  success?: boolean;
+  error?: string;
+  stderr?: string;
+  message?: string;
+  stdout?: string;
+}> {
+  const { sessionId, targetDir } = options;
+  const cleanDir = (targetDir || '').trim().replace(/^[/\\]+/, '');
+  let wsTarget: string | null = null;
+
+  if (cleanDir && cleanDir !== '.' && cleanDir !== 'root') {
+    const abs = path.resolve(process.cwd(), cleanDir);
+    if (abs.startsWith(WORKSPACES_ROOT + path.sep)) {
+      wsTarget = abs;
+    }
+  } else if (!cleanDir && sessionId) {
+    const candidate = getWorkspaceDir(sanitizeSessionId(sessionId));
+    const hasWsPkg = await fs.access(path.join(candidate, 'package.json')).then(() => true).catch(() => false);
+    if (hasWsPkg) wsTarget = candidate;
+  }
+
+  if (wsTarget) {
+    const depRes = await ensureWorkspaceDependencies(wsTarget, true);
+    if (depRes.mode === 'symlink' || depRes.mode === 'npm_install' || depRes.mode === 'skipped') {
+      return { success: true, message: depRes.note };
+    }
+    return { success: true, message: depRes.note };
+  }
+
+  const forceLegacy = await hasRootPeerConflicts();
+  try {
+    const res = await runNpmInstallFast(process.cwd(), '', {
+      timeoutMs: 120000,
+      forceLegacyPeerDeps: forceLegacy,
+    });
+    return {
+      success: true,
+      message: `Installed all package.json dependencies via npm install${res.legacyPeerDeps ? ' (--legacy-peer-deps)' : ''}.`,
+      stdout: res.stdout.trim().slice(-1500),
+    };
+  } catch (err: any) {
+    return {
+      error: `npm install failed: ${err?.message || 'Unknown error'}`,
+      stderr: String(err?.message || '').slice(-1500),
+    };
+  }
+}
+
+async function ensureWorkspaceDependencies(
+  wsDir: string,
+  forceVerify: boolean = false
+): Promise<{
   mode: 'symlink' | 'npm_install' | 'skipped' | 'partial';
   note: string;
 }> {
@@ -477,16 +793,35 @@ async function ensureWorkspaceDependencies(wsDir: string): Promise<{
   const hasPkg = await fs.access(wsPkgPath).then(() => true).catch(() => false);
   if (!hasPkg) return { mode: 'skipped', note: 'No package.json (static/non-Node project).' };
 
-  const hasNm = await fs.lstat(wsNodeModules).then(() => true).catch(() => false);
-  if (hasNm) return { mode: 'skipped', note: 'node_modules already present.' };
-
   try {
     const rawPkg = await fs.readFile(wsPkgPath, 'utf-8');
     const pkg = JSON.parse(rawPkg);
-    const allDeps = [
-      ...Object.keys(pkg.dependencies || {}),
-      ...Object.keys(pkg.devDependencies || {}),
-    ];
+    const depsMap: Record<string, string> = {
+      ...(pkg.dependencies || {}),
+      ...(pkg.devDependencies || {}),
+    };
+    const allDeps = Object.keys(depsMap);
+
+    const nmStat = await fs.lstat(wsNodeModules).catch(() => null);
+    if (nmStat && !forceVerify) {
+      // Quick check: if all declared deps already resolve in wsDir/node_modules, skip
+      let allPresent = true;
+      for (const dep of allDeps) {
+        const exists = await fs.access(path.join(wsNodeModules, dep)).then(() => true).catch(() => false);
+        if (!exists) {
+          allPresent = false;
+          break;
+        }
+      }
+      if (allPresent) {
+        return { mode: 'skipped', note: 'node_modules already satisfies all dependencies.' };
+      }
+    }
+
+    if (allDeps.length === 0) {
+      if (!nmStat) await fs.symlink(rootNodeModules, wsNodeModules, 'dir').catch(() => {});
+      return { mode: 'symlink', note: 'No external dependencies declared; linked shared node_modules.' };
+    }
 
     const missingInRoot: string[] = [];
     for (const dep of allDeps) {
@@ -495,25 +830,81 @@ async function ensureWorkspaceDependencies(wsDir: string): Promise<{
     }
 
     if (missingInRoot.length === 0) {
-      await fs.symlink(rootNodeModules, wsNodeModules, 'dir');
+      if (nmStat && !nmStat.isSymbolicLink()) {
+        await syncMergedWorkspaceNodeModules(wsDir);
+      } else if (!nmStat) {
+        await fs.symlink(rootNodeModules, wsNodeModules, 'dir');
+      }
       return { mode: 'symlink', note: `Instant-linked all ${allDeps.length} dependencies from root node_modules.` };
     }
 
-    try {
-      await execPromise('npm install --no-audit --no-fund --legacy-peer-deps', {
-        cwd: wsDir,
-        timeout: 90000,
+    // Install ONLY the missing packages in isolated .nexus_deps and merge with root node_modules (fast & conflict-free)
+    const missingSpecArgs = missingInRoot
+      .map((name) => {
+        const ver = String(depsMap[name] || '').trim();
+        if (!ver || /^(?:workspace:|file:|link:|git\+|github:)/i.test(ver)) return name;
+        return `${name}@${ver}`;
       });
-      return { mode: 'npm_install', note: `Installed ${allDeps.length} packages via npm install.` };
-    } catch (instErr: any) {
-      await fs.symlink(rootNodeModules, wsNodeModules, 'dir').catch(() => {});
+
+    const extraDir = path.join(wsDir, '.nexus_deps');
+    await fs.mkdir(extraDir, { recursive: true });
+    await fs.writeFile(
+      path.join(extraDir, 'package.json'),
+      JSON.stringify({ name: 'nexus-ws-extra-deps', private: true, dependencies: {} }, null, 2),
+      'utf-8'
+    );
+
+    try {
+      await runNpmInstallFast(extraDir, missingSpecArgs.join(' '), {
+        timeoutMs: 120000,
+        forceLegacyPeerDeps: true,
+      });
+      await syncMergedWorkspaceNodeModules(wsDir);
       return {
-        mode: 'partial',
-        note: `npm install hit an issue (${(instErr?.message || '').slice(0, 140)}); symlinked root node_modules as fallback. Missing: ${missingInRoot.join(', ')}`,
+        mode: 'npm_install',
+        note: `Installed ${missingInRoot.length} missing package(s) [${missingInRoot.slice(0, 8).join(', ')}${missingInRoot.length > 8 ? '...' : ''}] & linked ${allDeps.length - missingInRoot.length} shared packages.`,
       };
+    } catch (batchErr: any) {
+      // Fallback 1: remove lockfile/incompatible node_modules symlink and run full npm install in wsDir
+      if (nmStat?.isSymbolicLink()) {
+        await fs.unlink(wsNodeModules).catch(() => {});
+      }
+      await fs.unlink(path.join(wsDir, 'package-lock.json')).catch(() => {});
+      try {
+        await runNpmInstallFast(wsDir, '', {
+          timeoutMs: 120000,
+          forceLegacyPeerDeps: true,
+        });
+        return { mode: 'npm_install', note: `Installed all ${allDeps.length} dependencies directly in workspace.` };
+      } catch {
+        // Fallback 2: install missing packages individually so one broken package doesn't block the rest
+        const installedOk: string[] = [];
+        const failedPkgs: string[] = [];
+        for (const name of missingInRoot.slice(0, 25)) {
+          try {
+            await runNpmInstallFast(extraDir, name, { timeoutMs: 30000, forceLegacyPeerDeps: true });
+            installedOk.push(name);
+          } catch {
+            failedPkgs.push(name);
+          }
+        }
+        await syncMergedWorkspaceNodeModules(wsDir).catch(async () => {
+          if (!await fs.lstat(wsNodeModules).then(() => true).catch(() => false)) {
+            await fs.symlink(rootNodeModules, wsNodeModules, 'dir').catch(() => {});
+          }
+        });
+        return {
+          mode: failedPkgs.length === 0 ? 'npm_install' : 'partial',
+          note: failedPkgs.length === 0
+            ? `Installed ${installedOk.length} missing packages individually & linked shared node_modules.`
+            : `Installed [${installedOk.join(', ')}]; failed [${failedPkgs.join(', ')}]: ${(batchErr?.message || '').slice(0, 120)}`,
+        };
+      }
     }
   } catch (err: any) {
-    await fs.symlink(rootNodeModules, wsNodeModules, 'dir').catch(() => {});
+    if (!await fs.lstat(wsNodeModules).then(() => true).catch(() => false)) {
+      await fs.symlink(rootNodeModules, wsNodeModules, 'dir').catch(() => {});
+    }
     return { mode: 'partial', note: `Dependency check fallback: ${err?.message || 'symlinked root node_modules'}` };
   }
 }
@@ -531,7 +922,7 @@ async function normalizeClonedWorkspaceForPreview(wsDir: string, safeId: string)
     }
   }
 
-  // 2. Normalize package.json (convert resolutions -> overrides, drop packageManager/preinstall)
+  // 2. Normalize package.json (convert resolutions -> overrides, drop packageManager/preinstall/postinstall blockers)
   const pkgPath = path.join(wsDir, 'package.json');
   try {
     const raw = await fs.readFile(pkgPath, 'utf-8');
@@ -572,7 +963,7 @@ async function normalizeClonedWorkspaceForPreview(wsDir: string, safeId: string)
             patched = patched.replace(/export\s+default\s*\{/, `export default {\n  base: '/w/${safeId}/',`);
           }
         } else {
-          patched = patched.replace(/base\s*:\s*['"][^'"]*['"]/, `base: '/w/${safeId}/'`);
+          patched = patched.replace(/base\s*:\s*[^,\n}]+/, `base: '/w/${safeId}/'`);
         }
 
         if (patched !== orig) {
@@ -652,7 +1043,8 @@ export async function cloneGitHubRepoToWorkspace(options: {
   await fs.rm(wsDir, { recursive: true, force: true }).catch(() => {});
   await fs.mkdir(path.dirname(wsDir), { recursive: true });
 
-  const branchFlag = options.branch ? ` --branch "${options.branch.replace(/[^A-Za-z0-9_./-]/g, '')}"` : '';
+  const effectiveBranch = options.branch || parsed.branchFromUrl;
+  const branchFlag = effectiveBranch ? ` --branch "${effectiveBranch.replace(/[^A-Za-z0-9_./-]/g, '')}"` : '';
   const token = process.env.GITHUB_TOKEN?.trim();
   const authPrefix = token
     ? `-c http.https://github.com/.extraheader="AUTHORIZATION: basic ${Buffer.from(`x-access-token:${token}`).toString('base64')}" `
@@ -660,7 +1052,11 @@ export async function cloneGitHubRepoToWorkspace(options: {
   const gitCmd = `git ${authPrefix}clone --depth 1${branchFlag} "${parsed.cloneUrl}" "${wsDir}"`;
 
   try {
-    await execPromise(gitCmd, { cwd: process.cwd(), timeout: 60000 });
+    await execPromise(gitCmd, {
+      cwd: process.cwd(),
+      timeout: 120000,
+      env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+    });
   } catch (cloneErr: any) {
     const cleanErr = String(cloneErr?.stderr || cloneErr?.message || 'Git clone failed').replace(/AUTHORIZATION: basic [A-Za-z0-9+/=]+/gi, 'AUTHORIZATION: ***');
     return {
@@ -675,7 +1071,7 @@ export async function cloneGitHubRepoToWorkspace(options: {
   }
 
   const migrationNotes = await normalizeClonedWorkspaceForPreview(wsDir, safeId);
-  const dependencyStatus = await ensureWorkspaceDependencies(wsDir);
+  const dependencyStatus = await ensureWorkspaceDependencies(wsDir, true);
 
   const topEntries = await fs.readdir(wsDir, { withFileTypes: true }).catch(() => []);
   const files = topEntries
@@ -839,14 +1235,19 @@ async function startWorkspaceServerInternal(
     runtime.status = code === 0 ? 'stopped' : 'error';
   });
 
-  // Poll 127.0.0.1:port up to 35s until listening
+  // Poll 127.0.0.1:port up to 35s until listening (check both /w/<safeId>/ and / for cloned apps)
   let listening = false;
   const deadline = Date.now() + 35000;
   while (Date.now() < deadline) {
     if (runtime.status === 'error' || runtime.status === 'stopped') break;
     try {
       const probe = await fetch(`http://127.0.0.1:${port}/w/${safeId}/`, { signal: AbortSignal.timeout(900) });
-      if (probe.status > 0) {
+      if (probe.status > 0 && probe.status !== 404) {
+        listening = true;
+        break;
+      }
+      const rootProbe = await fetch(`http://127.0.0.1:${port}/`, { signal: AbortSignal.timeout(900) });
+      if (rootProbe.status > 0) {
         listening = true;
         break;
       }
